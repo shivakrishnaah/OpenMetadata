@@ -6156,18 +6156,18 @@
                         },
                         "clientId": {
                           "title": "Client ID",
-                          "description": "client_id for PowerBI.",
+                          "description": "client_id for PowerBI. Required unless only the .pbit files source is read.",
                           "type": "string"
                         },
                         "clientSecret": {
                           "title": "Client Secret",
-                          "description": "clientSecret for PowerBI.",
+                          "description": "clientSecret for PowerBI. Required unless only the .pbit files source is read.",
                           "type": "string",
                           "format": "password"
                         },
                         "tenantId": {
                           "title": "Tenant ID",
-                          "description": "Tenant ID for PowerBI.",
+                          "description": "Tenant ID for PowerBI. Required unless only the .pbit files source is read.",
                           "type": "string"
                         },
                         "apiURL": {
@@ -6221,7 +6221,7 @@
                         },
                         "pbitFilesSource": {
                           "title": "PowerBI .pbit Files Source",
-                          "description": "Source to get the .pbit files to extract lineage information",
+                          "description": "Source to get the .pbit files to extract lineage information. Without a Client ID, Client Secret and Tenant ID, the data models, their lineage and their metrics are read from these files alone.",
                           "oneOf": [
                             {
                               "$ref": "#/definitions/source/properties/serviceConnection/oneOf/1/properties/config/oneOf/2/definitions/localConfig"
@@ -6370,12 +6370,7 @@
                           "$ref": "#/definitions/source/properties/serviceConnection/oneOf/4/properties/config/oneOf/0/properties/supportsMetadataExtraction"
                         }
                       },
-                      "additionalProperties": false,
-                      "required": [
-                        "clientId",
-                        "clientSecret",
-                        "tenantId"
-                      ]
+                      "additionalProperties": false
                     },
                     {
                       "title": "PowerBIReportServerConnection",

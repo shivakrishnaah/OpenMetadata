@@ -89,8 +89,13 @@ from metadata.ingestion.source.dashboard.powerbi.constants import (
 from metadata.ingestion.source.dashboard.powerbi.databricks_parser import (
     parse_databricks_native_query_source,
 )
+from metadata.ingestion.source.dashboard.powerbi.file_client import (
+    PowerBIFileConfigException,
+    pbit_files_only,
+)
 from metadata.ingestion.source.dashboard.powerbi.metrics import (
     build_metric_request,
+    calculated_column_inputs,
     measure_dimensions,
     metric_measures_parents_first,
     powerbi_metric_name,
@@ -124,6 +129,9 @@ from metadata.utils.helpers import clean_uri
 from metadata.utils.logger import ingestion_logger
 
 logger = ingestion_logger()
+
+# Id of the one workspace a service read from .pbit files alone holds its datasets in
+PBIT_WORKSPACE_ID = "pbit-files"
 
 ListedItemT = TypeVar("ListedItemT")
 
@@ -371,6 +379,24 @@ class PowerbiSource(DashboardServiceSource):
             else:
                 logger.error("Unable to fetch any PowerBI workspaces")
 
+    def get_pbit_workspace_data(self) -> Iterable[Group]:
+        """The .pbit files' datasets as one workspace, for a service with no service principal."""
+        file_client = self.client.file_client
+        try:
+            read = file_client.get_datasets() if file_client else None
+        except PowerBIFileConfigException as exc:
+            logger.error("Could not read the .pbit files: %s", exc)
+            read = None
+        if read is None:
+            self._mark_workspace_listing_failed()
+            return
+        # Dashboards exist only in the Power BI service, so this run never lists them.
+        self.dashboard_listing.mark_failed()
+        if read.unread_files:
+            self.datamodel_listing.mark_failed()
+        self.progress_tracking.manual.set_total("Workspaces", 1)
+        yield Group(id=PBIT_WORKSPACE_ID, datasets=read.datasets)
+
     @classmethod
     def create(cls, config_dict, metadata: OpenMetadata, pipeline_name: str | None = None):
         config = WorkflowSource.model_validate(config_dict)
@@ -386,9 +412,12 @@ class PowerbiSource(DashboardServiceSource):
         - Some individual APIs are not able to yield data with details.
         - Workspaces that failed to fetch (None) are filtered out at the producer.
         """
-        producer = (
-            self.get_admin_workspace_data() if self.service_connection.useAdminApis else self.get_org_workspace_data()
-        )
+        if pbit_files_only(self.service_connection):
+            producer = self.get_pbit_workspace_data()
+        elif self.service_connection.useAdminApis:
+            producer = self.get_admin_workspace_data()
+        else:
+            producer = self.get_org_workspace_data()
         for workspace in producer:
             if workspace is None:
                 continue
@@ -746,6 +775,16 @@ class PowerbiSource(DashboardServiceSource):
             return
         yield from super().mark_charts_as_deleted()
 
+    def mark_datamodels_as_deleted(self) -> Iterable[Either]:
+        """
+        Skip the stale-data-model pass when some .pbit file could not be read: its data model is missing
+        from the run's live set, so the pass would soft-delete it
+        """
+        if pbit_files_only(self.service_connection) and self.datamodel_listing.has_failed:
+            logger.warning("Not marking data models as deleted: some .pbit files could not be read")
+            return
+        yield from super().mark_datamodels_as_deleted()
+
     def _get_child_measures(self, table: PowerBiTable) -> list[Column]:
         """
         Extract the measures of the table
@@ -944,9 +983,13 @@ class PowerbiSource(DashboardServiceSource):
                 if isinstance(dataset, Dataset):
                     data_model_type = DataModelType.PowerBIDataModel.value
                     datamodel_columns = self._get_column_info(dataset)
-                    source_url = self._get_dataset_url(
-                        workspace_id=self.context.get().workspace.id,  # pyright: ignore[reportAttributeAccessIssue]
-                        dataset_id=dataset.id,
+                    source_url = (
+                        None
+                        if pbit_files_only(self.service_connection)
+                        else self._get_dataset_url(
+                            workspace_id=self.context.get().workspace.id,  # pyright: ignore[reportAttributeAccessIssue]
+                            dataset_id=dataset.id,
+                        )
                     )
                 elif isinstance(dataset, Dataflow):
                     data_model_type = DataModelType.PowerBIDataFlow.value
@@ -982,7 +1025,7 @@ class PowerbiSource(DashboardServiceSource):
                     columns=datamodel_columns,
                     project=self.get_project_name(dashboard_details=dataset),
                     owners=self.get_owner_ref(dashboard_details=dataset),
-                    sourceUrl=SourceUrl(source_url),
+                    sourceUrl=SourceUrl(source_url) if source_url else None,
                 )
                 yield Either(right=data_model_request)  # pyright: ignore[reportCallIssue]
                 self.register_record_datamodel(datamodel_request=data_model_request)
@@ -1671,9 +1714,12 @@ class PowerbiSource(DashboardServiceSource):
         db_service_prefix: str | None,
         table: PowerBiTable,
         datamodel_entity: DashboardDataModel,
+        model_tables: list[PowerBiTable] | None = None,
     ) -> Iterable[Either[AddLineageRequest]]:
         """
         Method to create lineage between table and datamodels
+
+        ``model_tables`` are all the tables of the data model, for its calculated columns that read ``table``.
         """
         (
             prefix_service_name,
@@ -1737,8 +1783,17 @@ class PowerbiSource(DashboardServiceSource):
                             table_entity.name.root,  # pyright: ignore[reportAttributeAccessIssue]
                             datamodel_entity.name.root,
                         )
-                        columns_list = [column.name for column in (table.columns or []) if column.name]
+                        columns_list = [
+                            column.name for column in (table.columns or []) if column.name and not column.expression
+                        ]
                         column_lineage = self._get_column_lineage(table_entity, datamodel_entity, columns_list)
+                        if isinstance(table_entity, Table):
+                            column_lineage = [
+                                *(column_lineage or []),
+                                *self._get_calculated_column_lineage(
+                                    table, table_entity, datamodel_entity, model_tables or [table]
+                                ),
+                            ]
                         yield self._get_add_lineage_request(
                             to_entity=datamodel_entity,
                             from_entity=table_entity,
@@ -1755,6 +1810,49 @@ class PowerbiSource(DashboardServiceSource):
                     stackTrace=traceback.format_exc(),
                 )
             )
+
+    def _get_calculated_column_lineage(
+        self,
+        table: PowerBiTable,
+        table_entity: Table,
+        datamodel_entity: DashboardDataModel,
+        model_tables: list[PowerBiTable],
+    ) -> list[ColumnLineage]:
+        """The model's calculated columns that read ``table``, from its warehouse columns, with their DAX."""
+        column_lineage = []
+        table_name = (table.name or "").lower()
+        for home in model_tables:
+            for column in home.columns or []:
+                if not (home.name and column.name and column.expression):
+                    continue
+                from_columns = [
+                    from_column
+                    for read_table, read_column in calculated_column_inputs(model_tables, home, column)
+                    if read_table.lower() == table_name
+                    and (from_column := get_column_fqn(table_entity=table_entity, column=read_column))
+                ]
+                to_column = self._get_data_model_table_column_fqn(datamodel_entity, home.name, column.name)
+                if from_columns and to_column:
+                    column_lineage.append(
+                        ColumnLineage(
+                            fromColumns=[FullyQualifiedEntityName(from_column) for from_column in from_columns],
+                            toColumn=FullyQualifiedEntityName(to_column),
+                            function=SqlFunction(column.expression),
+                        )  # pyright: ignore[reportCallIssue]
+                    )
+        return column_lineage
+
+    @staticmethod
+    def _get_data_model_table_column_fqn(data_model_entity: DashboardDataModel, table: str, column: str) -> str | None:
+        """FQN of ``column`` of the data model table ``table``, where names repeat across tables."""
+        table_name, column_name = truncate_column_name(table).lower(), truncate_column_name(column).lower()
+        for table_column in data_model_entity.columns or []:
+            if table_column.name.root.lower() != table_name:
+                continue
+            for child_column in table_column.children or []:
+                if child_column.name.root.lower() == column_name and child_column.fullyQualifiedName:
+                    return model_str(child_column.fullyQualifiedName)
+        return None
 
     def create_table_datamodel_lineage_from_files(
         self,
@@ -1785,6 +1883,7 @@ class PowerbiSource(DashboardServiceSource):
                         db_service_prefix=db_service_prefix,
                         table=table,
                         datamodel_entity=datamodel_entity,
+                        model_tables=datamodel_schema_file.tables,
                     )
         except Exception as exc:  # pylint: disable=broad-except
             yield Either(
@@ -2373,13 +2472,15 @@ class PowerbiSource(DashboardServiceSource):
                                 db_service_prefix=db_service_prefix,
                                 table=table,
                                 datamodel_entity=datamodel_entity,
+                                model_tables=datamodel.tables,
                             )
                         # 2. dataset-upstreamDataflow lineage
                         yield from self.create_dataset_upstream_dataflow_lineage(datamodel, datamodel_entity)
                         # 3. dataset-upstreamDataset lineage
                         yield from self.create_dataset_upstream_dataset_lineage(datamodel, datamodel_entity)
-                        # create the lineage between table and datamodel using the pbit files
-                        if self.client.file_client:
+                        # create the lineage between table and datamodel using the pbit files,
+                        # unless the dataset was read from them
+                        if self.client.file_client and not pbit_files_only(self.service_connection):
                             yield from self.create_table_datamodel_lineage_from_files(
                                 db_service_prefix=db_service_prefix,
                                 datamodel_entity=datamodel_entity,
@@ -2558,7 +2659,8 @@ class PowerbiSource(DashboardServiceSource):
         Get the project / workspace / folder / collection name of the dashboard
         """
         try:
-            return str(self.context.get().workspace.name)  # pyright: ignore[reportAttributeAccessIssue]
+            workspace_name = self.context.get().workspace.name  # pyright: ignore[reportAttributeAccessIssue]
+            return str(workspace_name) if workspace_name else None
         except Exception as exc:
             logger.debug(traceback.format_exc())
             logger.warning(f"Error fetching project name for {dashboard_details.id}: {exc}")

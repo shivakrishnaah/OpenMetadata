@@ -105,6 +105,7 @@ class TestGetDatamodelSchemaFilesFromPbit:
         result = get_datamodel_schema_files_from_pbit(str(tmp_path))
 
         assert result is not None, "one unreadable archive must not turn the whole run into None"
-        assert len(result) == 1
-        assert [table.name for table in result[0].tables] == ["sales"]
-        assert result[0].connectionFile.RemoteArtifacts[0].DatasetId == "dataset-1"
+        assert len(result.schemas) == 1
+        assert [table.name for table in result.schemas[0].tables] == ["sales"]
+        assert result.schemas[0].connectionFile.RemoteArtifacts[0].DatasetId == "dataset-1"
+        assert result.unread_files == ["bad"]

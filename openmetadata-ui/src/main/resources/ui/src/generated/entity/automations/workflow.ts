@@ -2180,7 +2180,7 @@ export interface AirflowConnectionObject {
      *
      * User's Client ID. This user should have privileges to read all the metadata in Looker.
      *
-     * client_id for PowerBI.
+     * client_id for PowerBI. Required unless only the .pbit files source is read.
      *
      * client_id for Sigma.
      *
@@ -2434,7 +2434,7 @@ export interface AirflowConnectionObject {
      *
      * User's Client Secret.
      *
-     * clientSecret for PowerBI.
+     * clientSecret for PowerBI. Required unless only the .pbit files source is read.
      *
      * clientSecret for Sigma.
      *
@@ -2448,7 +2448,7 @@ export interface AirflowConnectionObject {
      *
      * Azure Directory (tenant) ID for Service Principal authentication.
      *
-     * Tenant ID for PowerBI.
+     * Tenant ID for PowerBI. Required unless only the .pbit files source is read.
      *
      * Directory (tenant) ID from Azure Active Directory
      */
@@ -2574,7 +2574,9 @@ export interface AirflowConnectionObject {
      */
     pagination_entity_per_page?: number;
     /**
-     * Source to get the .pbit files to extract lineage information
+     * Source to get the .pbit files to extract lineage information. Without a Client ID, Client
+     * Secret and Tenant ID, the data models, their lineage and their metrics are read from
+     * these files alone.
      */
     pbitFilesSource?: PowerBIPbitFilesSource;
     /**
@@ -5407,7 +5409,9 @@ export enum S3ConnectionType {
 }
 
 /**
- * Source to get the .pbit files to extract lineage information
+ * Source to get the .pbit files to extract lineage information. Without a Client ID, Client
+ * Secret and Tenant ID, the data models, their lineage and their metrics are read from
+ * these files alone.
  *
  * Local config source where no extra information needs to be sent.
  *

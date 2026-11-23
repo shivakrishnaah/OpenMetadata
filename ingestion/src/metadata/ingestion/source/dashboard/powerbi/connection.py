@@ -15,6 +15,7 @@ Source connection handler
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from metadata.core.connections.test_connection import (
@@ -25,6 +26,7 @@ from metadata.core.connections.test_connection import (
     check,
     when,
 )
+from metadata.core.connections.test_connection.check import CheckError
 from metadata.core.connections.test_connection.checks.dashboard import DashboardStep
 from metadata.core.connections.test_connection.checks.rest import (
     fetch_list,
@@ -42,12 +44,19 @@ from metadata.ingestion.source.dashboard.powerbi.client import (
     PowerBiApiClient,
     PowerBiClient,
 )
-from metadata.ingestion.source.dashboard.powerbi.file_client import PowerBiFileClient
+from metadata.ingestion.source.dashboard.powerbi.file_client import (
+    PowerBiFileClient,
+    PowerBIFileConfigException,
+    pbit_files_only,
+)
+
+READ_PBIT_FILES = "read .pbit files"
 
 if TYPE_CHECKING:
     from metadata.core.connections.lifetime import Borrowed
     from metadata.core.connections.test_connection import ChecksProvider
     from metadata.core.connections.test_connection.classifier import Matcher
+    from metadata.ingestion.source.dashboard.powerbi.models import PbitDatasets
 
 
 def _contains_any(*tokens: str) -> Matcher:
@@ -108,6 +117,11 @@ POWERBI_ERRORS = ErrorPack(
     # troubleshooting guide, a service principal that is not enabled for the
     # (admin) APIs returns 401, while a missing workspace/resource grant returns
     # 403 - so the two split on tenant-enablement vs. workspace access.
+    when(Matchers.exception(PowerBIFileConfigException)).diagnose(
+        "Could not read the .pbit files",
+        fix="Check the .pbit files source: the local path, or the bucket, prefix and credentials of the "
+        "cloud storage it points at.",
+    ),
     when(Matchers.exception(InvalidSourceException)).diagnose(
         "Authentication failed",
         fix="Could not acquire an OAuth token. Check the Client ID, Client Secret, and Tenant ID, "
@@ -153,9 +167,6 @@ class PowerBIChecks:
     ``CheckAccess`` is the gate: it acquires an OAuth token, so a bad service
     principal fails fast before any list endpoint is dialled. ``GetDashboards``
     then exercises list access.
-
-    ``CheckAccess`` is the gate: reading the borrowed client does MSAL discovery
-    and acquires the token, so a bad service principal fails there.
     """
 
     errors = POWERBI_ERRORS
@@ -188,6 +199,66 @@ class PowerBIChecks:
         )
 
 
+class PowerBIFileChecks:
+    """Test-connection checks for a PowerBI service read from .pbit files alone.
+
+    ``CheckAccess`` reads the files. ``GetDashboards`` passes with a caveat: dashboards
+    exist only in the Power BI service, so none are read without a service principal.
+    """
+
+    errors = POWERBI_ERRORS
+
+    def __init__(self, powerbi: Borrowed[PowerBiClient]) -> None:
+        self._powerbi = powerbi
+
+    def _read(self) -> PbitDatasets:
+        file_client = self._powerbi.client.file_client
+        read = file_client.get_datasets() if file_client else None
+        if read is None:
+            raise PowerBIFileConfigException("The .pbit files could not be read")
+        return read
+
+    @check(DashboardStep.CheckAccess)
+    def check_access(self) -> Evidence:
+        try:
+            read = self._read()
+        except Exception as cause:
+            raise CheckError(cause, Evidence(command=READ_PBIT_FILES)) from cause
+        evidence = fetch_list(
+            lambda: read.datasets,
+            noun="data model",
+            command=READ_PBIT_FILES,
+            empty_caveat=Diagnosis(
+                title="No .pbit data models found",
+                remediation="The .pbit files source was read but held no data model. Check its path, or "
+                "bucket and prefix, and that the files are templates exported from Power BI Desktop "
+                "(File > Export > Power BI template).",
+            ),
+        )
+        if read.unread_files:
+            return replace(
+                evidence,
+                caveat=Diagnosis(
+                    title="Some .pbit files could not be read",
+                    remediation=f"Not read: {', '.join(read.unread_files)}. Check that each is a whole template "
+                    "exported from Power BI Desktop (File > Export > Power BI template).",
+                ),
+            )
+        return evidence
+
+    @check(DashboardStep.GetDashboards)
+    def get_dashboards(self) -> Evidence:
+        return Evidence(
+            summary="dashboards are not read from .pbit files",
+            caveat=Diagnosis(
+                title="Dashboards not ingested",
+                remediation="Without a Client ID, Client Secret and Tenant ID only the data models of the .pbit "
+                "files, their lineage and their metrics are ingested. Dashboards and reports exist only in the "
+                "Power BI service.",
+            ),
+        )
+
+
 class PowerBIConnection(BaseConnection[PowerBIConnectionConfig, PowerBiClient]):
     def _get_client(self) -> PowerBiClient:
         """
@@ -203,4 +274,6 @@ class PowerBIConnection(BaseConnection[PowerBIConnectionConfig, PowerBiClient]):
         )
 
     def checks(self) -> ChecksProvider:
+        if pbit_files_only(self.service_connection):
+            return PowerBIFileChecks(powerbi=self.borrow())
         return PowerBIChecks(powerbi=self.borrow())

@@ -114,7 +114,9 @@ class TestExtractDirRecreatedBeforeDownload:
             ) as mock_schema,
         ):
             get_pbit_files(s3_config)
-            mock_schema.assert_called_once_with(path=str(extract_dir))
+            # Each read gets a directory of its own inside the extract dir.
+            [call] = mock_schema.call_args_list
+            assert Path(call.kwargs["path"]).parent == extract_dir
 
         assert extract_dir.exists(), "extract_dir must be created by get_pbit_files before use"
 

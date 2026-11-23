@@ -172,7 +172,7 @@ def test_get_dashboards_wraps_failure_as_check_error():
 
 
 def test_get_dashboards_wraps_client_build_failure():
-    # Reading the borrow is what builds the client (MSAL discovery), and that read
+    # Reading the borrow is what builds the client, and that read
     # happens inside fetch_list's try, so a build failure still reports the step's
     # command rather than escaping raw.
     provider = PowerBIChecks(powerbi=Borrowed(MagicMock(side_effect=ValueError("authority discovery failed"))))

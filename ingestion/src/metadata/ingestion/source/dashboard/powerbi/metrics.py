@@ -33,7 +33,7 @@ from metadata.generated.schema.entity.data.metric import (
 from metadata.generated.schema.type.basic import EntityName, FullyQualifiedEntityName, Markdown
 from metadata.generated.schema.type.entityReference import EntityReference
 from metadata.generated.schema.type.entityReferenceList import EntityReferenceList
-from metadata.ingestion.source.dashboard.powerbi.models import Dataset, PowerBiMeasures, PowerBiTable
+from metadata.ingestion.source.dashboard.powerbi.models import Dataset, PowerBiColumns, PowerBiMeasures, PowerBiTable
 from metadata.utils.metric_naming import build_metric_name
 
 _FALLBACK_SERVICE_PREFIX = "powerbi"
@@ -199,6 +199,38 @@ def referenced_columns(dataset: Dataset, measure: PowerBiMeasures) -> list[tuple
         key = ((table_name or "").lower(), name.lower())
         if table_name and key in columns:
             found[key] = columns[key]
+    return list(found.values())
+
+
+def calculated_column_inputs(
+    tables: list[PowerBiTable], table: PowerBiTable, column: PowerBiColumns
+) -> list[tuple[str, str]]:
+    """``(table, column)`` names of the data columns a calculated column is computed from.
+
+    ``[Name]`` is a column of the calculated column's own table. A reference to another
+    calculated column is followed to the data columns it reads; a measure is not a column.
+    """
+    columns = {
+        ((model_table.name or "").lower(), model_column.name.lower()): (model_table, model_column)
+        for model_table in tables
+        for model_column in model_table.columns or []
+        if model_table.name and model_column.name
+    }
+    seen = {((table.name or "").lower(), (column.name or "").lower())}
+    pending = [(table, column)]
+    found: dict[tuple[str, str], tuple[str, str]] = {}
+    while pending:
+        home, current = pending.pop()
+        for table_name, name in dax_references(current.expression):
+            key = ((table_name or home.name or "").lower(), name.lower())
+            if key in seen or key not in columns:
+                continue
+            seen.add(key)
+            read_table, read_column = columns[key]
+            if read_column.expression:
+                pending.append((read_table, read_column))
+            elif read_table.name and read_column.name:
+                found[key] = (read_table.name, read_column.name)
     return list(found.values())
 
 

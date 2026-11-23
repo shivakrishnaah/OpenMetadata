@@ -122,7 +122,7 @@ export interface Connection {
     /**
      * User's Client ID. This user should have privileges to read all the metadata in Looker.
      *
-     * client_id for PowerBI.
+     * client_id for PowerBI. Required unless only the .pbit files source is read.
      *
      * Client ID for DOMO
      *
@@ -132,7 +132,7 @@ export interface Connection {
     /**
      * User's Client Secret.
      *
-     * clientSecret for PowerBI.
+     * clientSecret for PowerBI. Required unless only the .pbit files source is read.
      *
      * clientSecret for Sigma.
      */
@@ -272,7 +272,9 @@ export interface Connection {
      */
     pagination_entity_per_page?: number;
     /**
-     * Source to get the .pbit files to extract lineage information
+     * Source to get the .pbit files to extract lineage information. Without a Client ID, Client
+     * Secret and Tenant ID, the data models, their lineage and their metrics are read from
+     * these files alone.
      */
     pbitFilesSource?: PowerBIPbitFilesSource;
     /**
@@ -280,7 +282,7 @@ export interface Connection {
      */
     scope?: string[];
     /**
-     * Tenant ID for PowerBI.
+     * Tenant ID for PowerBI. Required unless only the .pbit files source is read.
      */
     tenantId?: string;
     /**
@@ -1169,7 +1171,9 @@ export enum IdentityType {
 }
 
 /**
- * Source to get the .pbit files to extract lineage information
+ * Source to get the .pbit files to extract lineage information. Without a Client ID, Client
+ * Secret and Tenant ID, the data models, their lineage and their metrics are read from
+ * these files alone.
  *
  * Local config source where no extra information needs to be sent.
  *

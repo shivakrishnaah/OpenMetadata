@@ -17,6 +17,7 @@ import math
 import traceback
 from collections.abc import Callable
 from copy import deepcopy
+from functools import cached_property
 from time import sleep
 from typing import Any
 
@@ -29,6 +30,7 @@ from metadata.generated.schema.entity.services.connections.dashboard.powerBIConn
 from metadata.generated.schema.type.filterPattern import FilterPattern
 from metadata.ingestion.api.steps import InvalidSourceException
 from metadata.ingestion.connections.source_api_client import TrackedREST
+from metadata.ingestion.models.custom_pydantic import CustomSecretStr
 from metadata.ingestion.ometa.client import ClientConfig, LimitsException
 from metadata.ingestion.source.dashboard.powerbi.file_client import PowerBiFileClient
 from metadata.ingestion.source.dashboard.powerbi.models import (
@@ -107,11 +109,6 @@ class PowerBiApiClient:
             MAX_PAGINATION_ENTITY_PER_PAGE,
             self.config.pagination_entity_per_page or DEFAULT_PAGINATION_ENTITY_PER_PAGE,
         )
-        self.msal_client = msal.ConfidentialClientApplication(
-            client_id=self.config.clientId,
-            client_credential=self.config.clientSecret.get_secret_value(),
-            authority=self.config.authorityURI + self.config.tenantId,
-        )
         client_config = ClientConfig(
             base_url=clean_uri(self.config.apiURL),
             api_version="v1.0",
@@ -124,16 +121,36 @@ class PowerBiApiClient:
         )
         self.client = TrackedREST(client_config, source_name="powerbi")
 
+    def _service_principal(self) -> tuple[str, CustomSecretStr, str]:
+        """The client id, secret and tenant id; a service that reads only .pbit files has none."""
+        client_id, client_secret, tenant_id = self.config.clientId, self.config.clientSecret, self.config.tenantId
+        if not (client_id and client_secret and tenant_id):
+            raise InvalidSourceException(
+                "Client ID, Client Secret and Tenant ID are required to call the Power BI API."
+            )
+        return client_id, client_secret, tenant_id
+
+    @cached_property
+    def msal_client(self) -> msal.ConfidentialClientApplication:
+        """Built on first use, so a service that reads only .pbit files needs no service principal."""
+        client_id, client_secret, tenant_id = self._service_principal()
+        return msal.ConfidentialClientApplication(
+            client_id=client_id,
+            client_credential=client_secret.get_secret_value(),
+            authority=(self.config.authorityURI or "") + tenant_id,
+        )
+
     def get_auth_token(self) -> tuple[str, str]:
         """
         Method to generate PowerBi access token
         """
         logger.info("Generating PowerBi access token")
-
-        response_data = self.get_auth_token_from_cache()
+        # Built outside the retrying token calls below, so a missing credential or bad authority fails once.
+        msal_client = self.msal_client
+        response_data = self.get_auth_token_from_cache(msal_client)
         if not response_data:
             logger.info("Token does not exist in the cache. Getting a new token.")
-            response_data = self.generate_new_auth_token()
+            response_data = self.generate_new_auth_token(msal_client)
         response_data = response_data or {}
         auth_response = PowerBiToken(**response_data)
         if not auth_response.access_token:
@@ -144,12 +161,12 @@ class PowerBiApiClient:
         logger.info("PowerBi Access Token generated successfully")
         return auth_response.access_token, auth_response.expires_in
 
-    def generate_new_auth_token(self) -> dict | None:
+    def generate_new_auth_token(self, msal_client: msal.ConfidentialClientApplication) -> dict | None:
         """generate new auth token"""
         retry = AUTH_TOKEN_MAX_RETRIES
         while retry:
             try:
-                response_data = self.msal_client.acquire_token_for_client(scopes=self.config.scope)
+                response_data = msal_client.acquire_token_for_client(scopes=self.config.scope)
                 return response_data  # noqa: RET504, TRY300
             except Exception as exc:
                 logger.debug(traceback.format_exc())
@@ -166,12 +183,12 @@ class PowerBiApiClient:
                     logger.warning("Could not generate new token after maximum retries, Please check provided configs")
         return None
 
-    def get_auth_token_from_cache(self) -> dict | None:
+    def get_auth_token_from_cache(self, msal_client: msal.ConfidentialClientApplication) -> dict | None:
         """fetch auth token from cache"""
         retry = AUTH_TOKEN_MAX_RETRIES
         while retry:
             try:
-                response_data = self.msal_client.acquire_token_silent(scopes=self.config.scope, account=None)
+                response_data = msal_client.acquire_token_silent(scopes=self.config.scope, account=None)
                 return response_data  # noqa: RET504, TRY300
             except Exception as exc:
                 logger.debug(traceback.format_exc())

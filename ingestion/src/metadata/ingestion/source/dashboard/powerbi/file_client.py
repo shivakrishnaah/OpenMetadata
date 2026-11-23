@@ -15,12 +15,14 @@ File Client for PowerBi
 import json
 import os
 import shutil
+import tempfile
 import traceback
+import uuid
 import zipfile
 from collections import defaultdict
 from contextlib import suppress
 from functools import singledispatch
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from metadata.clients.aws_client import AWSClient
 from metadata.clients.azure_client import AzureClient
@@ -41,6 +43,10 @@ from metadata.ingestion.connections.source_api_client import TrackedREST
 from metadata.ingestion.source.dashboard.powerbi.models import (
     ConnectionFile,
     DataModelSchema,
+    Dataset,
+    DatasetExpression,
+    PbitDatasets,
+    PbitFilesRead,
     PowerBiTable,
 )
 from metadata.readers.file.config_source_factory import get_reader
@@ -53,6 +59,14 @@ from metadata.utils.logger import utils_logger
 from metadata.utils.s3_utils import list_s3_objects
 
 logger = utils_logger()
+
+# Namespace of the ids given to the datasets of .pbit files that name no published dataset
+PBIT_DATASET_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "https://open-metadata.org/powerbi/pbit")
+
+
+def pbit_files_only(config: PowerBIConnection) -> bool:
+    """A .pbit files source and no service principal: the service is read from the files alone."""
+    return config.pbitFilesSource is not None and not (config.clientId or config.clientSecret or config.tenantId)
 
 
 def get_prefix_config(config) -> tuple[str | None, str | None]:
@@ -71,6 +85,12 @@ def _ensure_extract_dir(path: str | None) -> None:
     if path is None:
         raise PowerBIFileConfigException("PowerBI .pbit extraction directory is not configured")
     Path(path).mkdir(parents=True, exist_ok=True)
+
+
+def _run_dir(extract_dir: str | None) -> str:
+    """A directory of this read alone inside ``extract_dir``, so files another run left there are not read."""
+    _ensure_extract_dir(extract_dir)
+    return tempfile.mkdtemp(dir=extract_dir)
 
 
 def get_blobs_grouped_by_dir(blobs: list[str]) -> dict[str, list[str]]:
@@ -108,10 +128,11 @@ def download_pbit_files(
     client,
     bucket_name: str | None,
     extract_dir: str,
-):
+) -> list[str]:
     """
-    Method to download the files from sources
+    Method to download the files from sources, returning the local path of each
     """
+    downloaded = []
     for blobs in blob_grouped_by_directory.values():
         kwargs = {}
         if bucket_name:
@@ -129,6 +150,8 @@ def download_pbit_files(
             # create the required dir before downloading
             os.makedirs(os.path.dirname(local_file_path), exist_ok=True)  # noqa: PTH103, PTH120
             reader.download(path=blob, local_file_path=local_file_path, **kwargs)
+            downloaded.append(local_file_path)
+    return downloaded
 
 
 def _extract_pbit(zip_ref: zipfile.ZipFile, extract_dir: str) -> None:
@@ -151,21 +174,24 @@ def _get_datamodel_schema_list(path: str) -> list[DataModelSchema] | None:
     """
     Method maps the json to datamodel schema model
     """
-    reader = LocalReader(f"{path}/extracted")
-    connection_files = reader.get_local_files(search_key="Connections")
+    extracted = Path(path) / "extracted"
+    reader = LocalReader(extracted)
+    connection_files = sorted(reader.get_local_files(search_key="Connections"))
     datamodel_schema_list = []
     for connection_file in connection_files:
         try:
-            datamodel_schema = DataModelSchema()
+            datamodel_schema = DataModelSchema(file_path=Path(connection_file).parent.relative_to(extracted).as_posix())
             with open(connection_file, "rb") as file:  # noqa: PTH123
                 connection_json_file = json.load(file)
                 datamodel_schema.connectionFile = ConnectionFile(**connection_json_file)
 
-            datamodel_schema_file = connection_file.replace("Connections", "DataModelSchema")
+            datamodel_schema_file = str(Path(connection_file).with_name("DataModelSchema"))
             with open(datamodel_schema_file, "rb") as file:  # noqa: PTH123
                 data_model_schema_json_file = json.load(file)
-                datamodel_schema.tables = [
-                    PowerBiTable(**table) for table in data_model_schema_json_file.get("model")["tables"] or []
+                model = data_model_schema_json_file.get("model")
+                datamodel_schema.tables = [PowerBiTable(**table) for table in model["tables"] or []]
+                datamodel_schema.expressions = [
+                    DatasetExpression(**expression) for expression in model.get("expressions") or []
                 ]
             if datamodel_schema.tables and datamodel_schema.connectionFile:
                 datamodel_schema_list.append(datamodel_schema)
@@ -175,27 +201,46 @@ def _get_datamodel_schema_list(path: str) -> list[DataModelSchema] | None:
     return datamodel_schema_list
 
 
-def get_datamodel_schema_files_from_pbit(path: str) -> list[DataModelSchema] | None:
+def get_datamodel_schema_files_from_pbit(
+    path: str, extract_dir: str | None = None, file_paths: list[str] | None = None
+) -> PbitFilesRead | None:
     """
     Method to unzip the locally saved pbit files and get the schema files
+
+    Each file is extracted, by its path under ``path``, into a directory of this run alone inside
+    ``extract_dir``, so a file removed since an earlier run is not read again and files of one name in
+    two folders stay apart. ``file_paths`` are the files expected under ``path``, when they are known
+    from elsewhere than ``path`` itself: one missing from it is reported as unread.
     """
     try:
-        reader = LocalReader(path)
-        file_paths = reader.get_local_files(search_key=".pbit")
-
-        for file_path in file_paths:
-            # One unreadable .pbit must not drop the schemas of the others. Damaged
-            # archives fail during extraction with many types (BadZipFile, zlib.error,
-            # EOFError, RuntimeError for encrypted entries, NotImplementedError for
-            # unsupported compression), so any failure skips only this file.
-            try:
-                with zipfile.ZipFile(file_path, "r") as zip_ref:
-                    _extract_pbit(zip_ref, f"{path}/extracted/{file_path.split('/')[-1].split('.')[0]}")
-            except Exception as exc:
-                logger.debug(traceback.format_exc())
-                logger.warning("Skipping .pbit file %s: %s", file_path, exc)
-
-        return _get_datamodel_schema_list(path)
+        source = Path(path)
+        if not source.is_dir():
+            logger.error("The .pbit files path is not a directory: %s", path)
+            return None
+        file_paths = sorted(
+            LocalReader(source).get_local_files(search_key=".pbit") if file_paths is None else file_paths
+        )
+        names = [
+            Path(file_path).resolve().relative_to(source.resolve()).with_suffix("").as_posix()
+            for file_path in file_paths
+        ]
+        if extract_dir:
+            Path(extract_dir).mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=extract_dir) as extract_root:
+            for file_path, name in zip(file_paths, names, strict=True):
+                # One unreadable .pbit must not drop the schemas of the others. Damaged
+                # archives fail during extraction with many types (BadZipFile, zlib.error,
+                # EOFError, RuntimeError for encrypted entries, NotImplementedError for
+                # unsupported compression), so any failure skips only this file.
+                try:
+                    with zipfile.ZipFile(file_path, "r") as zip_ref:
+                        _extract_pbit(zip_ref, f"{extract_root}/extracted/{name}")
+                except Exception as exc:
+                    logger.debug(traceback.format_exc())
+                    logger.warning("Skipping .pbit file %s: %s", file_path, exc)
+            schemas = _get_datamodel_schema_list(extract_root) or []
+        read = {schema.file_path for schema in schemas}
+        return PbitFilesRead(schemas=schemas, unread_files=[name for name in names if name not in read])
 
     except Exception as exc:
         logger.debug(traceback.format_exc())
@@ -204,7 +249,7 @@ def get_datamodel_schema_files_from_pbit(path: str) -> list[DataModelSchema] | N
 
 
 @singledispatch
-def get_pbit_files(config):
+def get_pbit_files(config) -> PbitFilesRead | None:
     """
     Single dispatch method to get the pbit files from different sources
     """
@@ -216,7 +261,8 @@ def get_pbit_files(config):
 @get_pbit_files.register
 def _(config: S3Config):
     try:
-        _ensure_extract_dir(config.pbitFilesExtractDir)
+        run_dir = _run_dir(config.pbitFilesExtractDir)
+        downloaded: list[str] = []
         bucket_name, prefix = get_prefix_config(config)
 
         client = AWSClient(config.securityConfig).get_client(service_name="s3")
@@ -231,17 +277,17 @@ def _(config: S3Config):
                 kwargs["Prefix"] = prefix if prefix.endswith("/") else f"{prefix}/"
 
             # Download the pbit files and store them in the local path
-            download_pbit_files(
+            downloaded += download_pbit_files(
                 blob_grouped_by_directory=get_blobs_grouped_by_dir(
                     blobs=[key["Key"] for key in list_s3_objects(client, **kwargs)]
                 ),
                 config=config,
                 client=client,
                 bucket_name=bucket["Name"],
-                extract_dir=config.pbitFilesExtractDir,
+                extract_dir=f"{run_dir}/{bucket['Name']}",
             )
         # Extract the datamodel schema files from pbit files and return the list of datamodel schema objects
-        return get_datamodel_schema_files_from_pbit(path=config.pbitFilesExtractDir)
+        return get_datamodel_schema_files_from_pbit(path=run_dir, extract_dir=run_dir, file_paths=downloaded)
 
     except Exception as exc:
         logger.debug(traceback.format_exc())
@@ -251,7 +297,8 @@ def _(config: S3Config):
 @get_pbit_files.register
 def _(config: AzureConfig):
     try:
-        _ensure_extract_dir(config.pbitFilesExtractDir)
+        run_dir = _run_dir(config.pbitFilesExtractDir)
+        downloaded: list[str] = []
         bucket_name, prefix = get_prefix_config(config)
 
         client = AzureClient(config.securityConfig).create_blob_client()
@@ -269,15 +316,15 @@ def _(config: AzureConfig):
                 blob_list = container_client.list_blobs()
 
             # Download the pbit files and store them in the local path
-            download_pbit_files(
+            downloaded += download_pbit_files(
                 blob_grouped_by_directory=get_blobs_grouped_by_dir(blobs=[blob.name for blob in blob_list]),
                 config=config,
                 client=client,
                 bucket_name=container_client.container_name,
-                extract_dir=config.pbitFilesExtractDir,
+                extract_dir=f"{run_dir}/{container_client.container_name}",
             )
         # Extract the datamodel schema files from pbit files and return the list of datamodel schema objects
-        return get_datamodel_schema_files_from_pbit(path=config.pbitFilesExtractDir)
+        return get_datamodel_schema_files_from_pbit(path=run_dir, extract_dir=run_dir, file_paths=downloaded)
 
     except Exception as exc:
         logger.debug(traceback.format_exc())
@@ -289,7 +336,8 @@ def _(config: AzureConfig):
 @get_pbit_files.register
 def _(config: GCSConfig):
     try:
-        _ensure_extract_dir(config.pbitFilesExtractDir)
+        run_dir = _run_dir(config.pbitFilesExtractDir)
+        downloaded: list[str] = []
         bucket_name, prefix = get_prefix_config(config)
         from google.cloud import storage  # pylint: disable=import-outside-toplevel
 
@@ -306,15 +354,15 @@ def _(config: GCSConfig):
             else:
                 obj_list = client.list_blobs(bucket.name)
 
-            download_pbit_files(
+            downloaded += download_pbit_files(
                 blob_grouped_by_directory=get_blobs_grouped_by_dir(blobs=[blob.name for blob in obj_list]),
                 config=config,
                 client=client,
                 bucket_name=bucket.name,
-                extract_dir=config.pbitFilesExtractDir,
+                extract_dir=f"{run_dir}/{bucket.name}",
             )
         # Extract the datamodel schema files from pbit files and return the list of datamodel schema objects
-        return get_datamodel_schema_files_from_pbit(path=config.pbitFilesExtractDir)
+        return get_datamodel_schema_files_from_pbit(path=run_dir, extract_dir=run_dir, file_paths=downloaded)
 
     except Exception as exc:
         logger.debug(traceback.format_exc())
@@ -324,11 +372,24 @@ def _(config: GCSConfig):
 @get_pbit_files.register
 def _(config: LocalConfig):
     try:
-        return get_datamodel_schema_files_from_pbit(path=config.path)
+        return get_datamodel_schema_files_from_pbit(path=config.path, extract_dir=config.pbitFilesExtractDir)
     except Exception as exc:
         logger.debug(traceback.format_exc())
         logger.error(f"Error getting pbit files from local: {exc}")
     return None
+
+
+def _dataset_from_schema(schema: DataModelSchema) -> Dataset:
+    """A .pbit's model as a dataset: the published dataset's id, or one derived from the file's path."""
+    file_path = schema.file_path or ""
+    artifacts = (schema.connectionFile.RemoteArtifacts if schema.connectionFile else None) or []
+    dataset_id = artifacts[0].DatasetId if artifacts else str(uuid.uuid5(PBIT_DATASET_NAMESPACE, file_path))
+    return Dataset(
+        id=dataset_id,
+        name=PurePosixPath(file_path).name,
+        tables=schema.tables or [],
+        expressions=schema.expressions or [],
+    )
 
 
 class PowerBIFileConfigException(Exception):  # noqa: N818
@@ -351,7 +412,27 @@ class PowerBiFileClient:
         """
         Get the data model schema mappings
         """
-        return get_pbit_files(self.config.pbitFilesSource)
+        read = get_pbit_files(self.config.pbitFilesSource)
+        return read.schemas if read else None
+
+    def get_datasets(self) -> PbitDatasets | None:
+        """The .pbit files' models as the datasets the Power BI API returns, one per published dataset."""
+        read = get_pbit_files(self.config.pbitFilesSource)
+        if read is None:
+            return None
+        datasets: dict[str, Dataset] = {}
+        for schema in read.schemas:
+            dataset = _dataset_from_schema(schema)
+            if dataset.id in datasets:
+                logger.warning(
+                    "Skipping .pbit file %s: %s, read first, is the same dataset %s",
+                    schema.file_path,
+                    datasets[dataset.id].name,
+                    dataset.id,
+                )
+                continue
+            datasets[dataset.id] = dataset
+        return PbitDatasets(datasets=list(datasets.values()), unread_files=read.unread_files)
 
     def delete_tmp_files(self):
         """

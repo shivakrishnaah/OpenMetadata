@@ -117,6 +117,15 @@ class PowerBiColumns(BaseModel):
     columnType: str | None = None  # noqa: N815
     description: str | None = None
     isHidden: bool | None = False  # noqa: N815
+    expression: str | None = None
+
+    @field_validator("expression", mode="before")
+    @classmethod
+    def normalize_expression(cls, v: str | list[str] | None) -> str | None:
+        """A calculated column's DAX; a .pbit stores a multi-line one as a list of lines."""
+        if isinstance(v, list):
+            return "\n".join(v)
+        return v
 
 
 class PowerBiMeasureModel(BaseModel):
@@ -370,8 +379,30 @@ class DataModelSchema(BaseModel):
     PowerBi Data Model Schema Model
     """
 
+    file_path: str | None = None
     tables: list[PowerBiTable] | None = None
     connectionFile: ConnectionFile | None = None  # noqa: N815
+    expressions: list[DatasetExpression] | None = None
+
+
+class PbitFilesRead(BaseModel):
+    """
+    The data model schemas read from a .pbit files source, and the files that could not be read.
+
+    A file is named by its path under the source, without the extension.
+    """
+
+    schemas: list[DataModelSchema] = []
+    unread_files: list[str] = []
+
+
+class PbitDatasets(BaseModel):
+    """
+    The datasets of a .pbit files source, and the files that could not be read.
+    """
+
+    datasets: list[Dataset] = []
+    unread_files: list[str] = []
 
 
 class ReportPage(BaseModel):

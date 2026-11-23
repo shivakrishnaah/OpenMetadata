@@ -131,3 +131,13 @@ Also lineage information can only be generated if the dataset is a <a href="http
 For more information please visit the PowerBI official documentation <a href="https://learn.microsoft.com/en-us/rest/api/power-bi/push-datasets/datasets-get-tables#limitations" target="_blank">here</a>.
 
 $$
+
+$$section
+### PowerBI .pbit Files Source $(id="pbitFilesSource")
+
+Where to read Power BI templates (`.pbit` files) from: a local path, or an Azure, GCS or S3 bucket. Export one from Power BI Desktop with `File` > `Export` > `Power BI template`.
+
+With a Client ID, Client Secret and Tenant ID, the files add lineage from the warehouse tables to the data models the Power BI API returns.
+
+Without them, the files alone are read: their data models, the lineage from the warehouse tables to them, and, with `Include Metrics`, their measures. Dashboards and reports exist only in the Power BI service, so none are ingested.
+$$

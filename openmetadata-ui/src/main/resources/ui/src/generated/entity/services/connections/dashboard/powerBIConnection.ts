@@ -28,13 +28,13 @@ export interface PowerBIConnection {
      */
     chartFilterPattern?: FilterPattern;
     /**
-     * client_id for PowerBI.
+     * client_id for PowerBI. Required unless only the .pbit files source is read.
      */
-    clientId: string;
+    clientId?: string;
     /**
-     * clientSecret for PowerBI.
+     * clientSecret for PowerBI. Required unless only the .pbit files source is read.
      */
-    clientSecret: string;
+    clientSecret?: string;
     /**
      * Regex to exclude or include dashboards that matches the pattern.
      */
@@ -56,7 +56,9 @@ export interface PowerBIConnection {
      */
     pagination_entity_per_page?: number;
     /**
-     * Source to get the .pbit files to extract lineage information
+     * Source to get the .pbit files to extract lineage information. Without a Client ID, Client
+     * Secret and Tenant ID, the data models, their lineage and their metrics are read from
+     * these files alone.
      */
     pbitFilesSource?: PowerBIPbitFilesSource;
     /**
@@ -69,9 +71,9 @@ export interface PowerBIConnection {
     scope?:                      string[];
     supportsMetadataExtraction?: boolean;
     /**
-     * Tenant ID for PowerBI.
+     * Tenant ID for PowerBI. Required unless only the .pbit files source is read.
      */
-    tenantId: string;
+    tenantId?: string;
     /**
      * Service Type
      */
@@ -105,7 +107,9 @@ export interface FilterPattern {
 }
 
 /**
- * Source to get the .pbit files to extract lineage information
+ * Source to get the .pbit files to extract lineage information. Without a Client ID, Client
+ * Secret and Tenant ID, the data models, their lineage and their metrics are read from
+ * these files alone.
  *
  * Local config source where no extra information needs to be sent.
  *
