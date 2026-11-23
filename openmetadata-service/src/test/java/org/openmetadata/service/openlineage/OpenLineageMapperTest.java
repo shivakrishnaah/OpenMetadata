@@ -32,6 +32,7 @@ import org.openmetadata.schema.api.lineage.openlineage.ColumnLineageField;
 import org.openmetadata.schema.api.lineage.openlineage.EventType;
 import org.openmetadata.schema.api.lineage.openlineage.Fields;
 import org.openmetadata.schema.api.lineage.openlineage.InputField;
+import org.openmetadata.schema.api.lineage.openlineage.InputFieldTransformation;
 import org.openmetadata.schema.api.lineage.openlineage.JobFacets;
 import org.openmetadata.schema.api.lineage.openlineage.OpenLineageInputDataset;
 import org.openmetadata.schema.api.lineage.openlineage.OpenLineageJob;
@@ -429,6 +430,58 @@ class OpenLineageMapperTest {
   }
 
   @Test
+  void mapRunEvent_withInputTransformations_writesEachTablesEntryFromItsOwnInputs() {
+    OpenLineageRunEvent event = createBaseEvent(EventType.COMPLETE);
+    OpenLineageInputDataset orders = createInputDataset("input-ns", "schema.orders");
+    OpenLineageInputDataset fx = createInputDataset("input-ns", "schema.fx");
+    OpenLineageOutputDataset output = createOutputDataset("output-ns", "schema.revenue");
+    ColumnLineageField revenue =
+        new ColumnLineageField()
+            .withInputFields(
+                List.of(
+                    transformedInput("schema.orders", "amount", "sum((amount * rate))"),
+                    transformedInput("schema.fx", "rate", "sum((amount * rate))"),
+                    transformedInput("schema.orders", "region", "(region = 'EU')"),
+                    transformedInput("schema.orders", "quantity", "sum((amount * rate))")));
+    Fields fields = new Fields();
+    fields.setAdditionalProperty("revenue_usd", revenue);
+    output.setOutputFacets(
+        new OutputDatasetFacets().withColumnLineage(new ColumnLineageFacet().withFields(fields)));
+    event.setInputs(List.of(orders, fx));
+    event.setOutputs(List.of(output));
+
+    when(entityResolver.resolveDataset(eq(output), eq(UPDATED_BY)))
+        .thenReturn(dataset(createEntityReference("o1", "service.db.schema.revenue")));
+    when(entityResolver.resolveDataset(eq(orders), eq(UPDATED_BY)))
+        .thenReturn(dataset(createEntityReference("i1", "service.db.schema.orders")));
+    when(entityResolver.resolveDataset(eq(fx), eq(UPDATED_BY)))
+        .thenReturn(dataset(createEntityReference("i2", "service.db.schema.fx")));
+    when(entityResolver.resolvePipeline(anyString(), anyString())).thenReturn(pipeline(null));
+
+    List<AddLineage> result = mapper.mapRunEvent(event, UPDATED_BY).lineageRequests();
+
+    String toColumn = "service.db.schema.revenue.revenue_usd";
+    assertEquals(
+        List.of(
+            new ColumnLineage()
+                .withFromColumns(
+                    List.of(
+                        "service.db.schema.orders.amount",
+                        "service.db.schema.orders.region",
+                        "service.db.schema.orders.quantity"))
+                .withToColumn(toColumn)
+                .withFunction("sum((amount * rate)); (region = 'EU')")),
+        result.get(0).getEdge().getLineageDetails().getColumnsLineage());
+    assertEquals(
+        List.of(
+            new ColumnLineage()
+                .withFromColumns(List.of("service.db.schema.fx.rate"))
+                .withToColumn(toColumn)
+                .withFunction("sum((amount * rate))")),
+        result.get(1).getEdge().getLineageDetails().getColumnsLineage());
+  }
+
+  @Test
   void mapRunEvent_withMultipleColumnLineageEntries_extractsAll() {
     OpenLineageRunEvent event = createBaseEvent(EventType.COMPLETE);
 
@@ -794,6 +847,16 @@ class OpenLineageMapperTest {
 
   private OpenLineageOutputDataset createOutputDataset(String namespace, String name) {
     return new OpenLineageOutputDataset().withNamespace(namespace).withName(name);
+  }
+
+  private static InputField transformedInput(String name, String field, String description) {
+    return new InputField()
+        .withNamespace("input-ns")
+        .withName(name)
+        .withField(field)
+        .withTransformations(
+            List.of(
+                new InputFieldTransformation().withType("DIRECT").withDescription(description)));
   }
 
   private static OpenLineageResolution dataset(EntityReference ref) {

@@ -158,6 +158,37 @@ export interface InputField {
      * The namespace of the input dataset.
      */
     namespace: string;
+    /**
+     * The transformations through which this input field contributes to the output field.
+     */
+    transformations?: InputFieldTransformation[];
+    [property: string]: any;
+}
+
+/**
+ * How an input field contributes to an output field, as the OpenLineage column lineage
+ * facet (1-2-0) reports it.
+ */
+export interface InputFieldTransformation {
+    /**
+     * A string representation of the transformation applied.
+     */
+    description?: string;
+    /**
+     * Whether the transformation masks the input's values.
+     */
+    masking?: boolean;
+    /**
+     * The kind of transformation, e.g. IDENTITY, TRANSFORMATION, AGGREGATION, JOIN, FILTER,
+     * GROUP_BY, SORT, WINDOW or CONDITIONAL.
+     */
+    subtype?: string;
+    /**
+     * DIRECT when the output column's value is derived from the input field's value; INDIRECT
+     * when the output column's value is impacted by the input field's value but not derived
+     * from it.
+     */
+    type?: string;
     [property: string]: any;
 }
 
