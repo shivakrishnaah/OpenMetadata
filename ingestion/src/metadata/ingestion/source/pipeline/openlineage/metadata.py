@@ -57,6 +57,7 @@ from metadata.generated.schema.entity.services.messagingService import Messaging
 from metadata.generated.schema.metadataIngestion.workflow import (
     Source as WorkflowSource,
 )
+from metadata.generated.schema.type.basic import FullyQualifiedEntityName, SqlFunction
 from metadata.generated.schema.type.entityLineage import (
     ColumnLineage,
     EntitiesEdge,
@@ -69,6 +70,7 @@ from metadata.ingestion.api.steps import InvalidSourceException
 from metadata.ingestion.models.pipeline_status import OMetaPipelineStatus
 from metadata.ingestion.ometa.ometa_api import OpenMetadata
 from metadata.ingestion.ometa.utils import model_str
+from metadata.ingestion.source.pipeline.openlineage.column_function import column_function
 from metadata.ingestion.source.pipeline.openlineage.models import (
     EntityDetails,
     EventType,
@@ -864,13 +866,20 @@ class OpenlineageSource(PipelineServiceSource):
     @classmethod
     def _create_output_lineage_dict(
         cls,
-        lineage_info: list[tuple[str, str, str, str]],
+        lineage_info: list[tuple[str, str, str, str, dict]],
     ) -> dict[str, dict[str, list[ColumnLineage]]]:
         result = defaultdict(lambda: defaultdict(list))
         for (output_table, input_table, output_column), group in groupby(lineage_info, lambda x: x[:3]):
-            input_columns = [input_col for _, _, _, input_col in group]
+            rows = list(group)
+            function = column_function([input_field for *_, input_field in rows])
 
-            result[output_table][input_table] += [ColumnLineage(toColumn=output_column, fromColumns=input_columns)]
+            result[output_table][input_table] += [
+                ColumnLineage(
+                    toColumn=FullyQualifiedEntityName(output_column),
+                    fromColumns=[FullyQualifiedEntityName(input_col) for _, _, _, input_col, _ in rows],
+                    function=SqlFunction(function) if function else None,
+                )
+            ]
 
         return result
 
@@ -915,12 +924,13 @@ class OpenlineageSource(PipelineServiceSource):
                     input_column = self._match_column_name(input_table_entity, input_field.get("field", ""))
                     if not output_column or not input_column:
                         continue
-                    _result.append(  # output table, input table, output column, input column
+                    _result.append(  # output table, input table, output column, input column, input field
                         (
                             output_table_fqn,
                             input_table_fqn,
                             f"{output_table_fqn}.{output_column}",
                             f"{input_table_fqn}.{input_column}",
+                            input_field,
                         )
                     )
 

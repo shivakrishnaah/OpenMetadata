@@ -330,7 +330,7 @@ class OpenLineageUnitTest(unittest.TestCase):
 
     def test_create_output_lineage_dict_single_lineage_entry(self):
         """Test with a single lineage entry."""
-        lineage_info = [("output_table", "input_table", "output_column", "input_column")]
+        lineage_info = [("output_table", "input_table", "output_column", "input_column", {})]
         result = self.open_lineage_source._create_output_lineage_dict(lineage_info)
         expected = {
             "output_table": {"input_table": [ColumnLineage(toColumn="output_column", fromColumns=["input_column"])]}
@@ -340,8 +340,8 @@ class OpenLineageUnitTest(unittest.TestCase):
     def test_create_output_lineage_dict_multiple_entries_different_outputs(self):
         """Test with multiple entries having different output tables."""
         lineage_info = [
-            ("output_table1", "input_table", "output_column1", "input_column"),
-            ("output_table2", "input_table", "output_column2", "input_column"),
+            ("output_table1", "input_table", "output_column1", "input_column", {}),
+            ("output_table2", "input_table", "output_column2", "input_column", {}),
         ]
         result = self.open_lineage_source._create_output_lineage_dict(lineage_info)
         expected = {
@@ -353,8 +353,8 @@ class OpenLineageUnitTest(unittest.TestCase):
     def test_create_output_lineage_dict_multiple_entries_same_output(self):
         """Test with multiple entries sharing the same output table."""
         lineage_info = [
-            ("output_table", "input_table1", "output_column", "input_column1"),
-            ("output_table", "input_table2", "output_column", "input_column2"),
+            ("output_table", "input_table1", "output_column", "input_column1", {}),
+            ("output_table", "input_table2", "output_column", "input_column2", {}),
         ]
         result = self.open_lineage_source._create_output_lineage_dict(lineage_info)
         expected = {
@@ -513,6 +513,67 @@ class OpenLineageUnitTest(unittest.TestCase):
                     ColumnLineage(
                         toColumn="database.schema.output_table.output_column2",
                         fromColumns=["database.schema.input_table_2.input_column2"],
+                    )
+                ],
+            }
+        }
+        self.assertEqual(result, expected)
+
+    @patch("metadata.ingestion.source.pipeline.openlineage.metadata.OpenlineageSource._get_by_name_cached")
+    @patch("metadata.ingestion.source.pipeline.openlineage.metadata.OpenlineageSource._get_table_fqn")
+    @patch("metadata.ingestion.source.pipeline.openlineage.metadata.OpenlineageSource._build_ol_name_to_fqn_map")
+    def test_get_column_lineage_writes_each_entry_from_its_own_inputs(
+        self, mock_build_map, mock_get_table_fqn, mock_get_by_name_cached
+    ):
+        mock_get_by_name_cached.return_value = None
+        mock_get_table_fqn.side_effect = lambda table_details, namespace=None: f"database.schema.{table_details.name}"
+        mock_build_map.return_value = {
+            "s3a://project-db/orders": "database.schema.orders",
+            "s3a://project-db/fx": "database.schema.fx",
+        }
+
+        def input_field(table, field, description):
+            return {
+                "field": field,
+                "namespace": "s3a://project-db",
+                "name": f"/{table}",
+                "transformations": [{"type": "DIRECT", "description": description}],
+            }
+
+        outputs = [
+            {
+                "name": "schema.revenue",
+                "facets": {
+                    "columnLineage": {
+                        "fields": {
+                            "revenue_usd": {
+                                "inputFields": [
+                                    input_field("orders", "amount", "sum((amount * rate))"),
+                                    input_field("orders", "region", "(region = 'EU')"),
+                                    input_field("fx", "rate", "sum((amount * rate))"),
+                                ]
+                            }
+                        }
+                    }
+                },
+            }
+        ]
+
+        result = self.open_lineage_source._get_column_lineage([], outputs)
+
+        to_column = "database.schema.revenue.revenue_usd"
+        expected = {
+            "database.schema.revenue": {
+                "database.schema.orders": [
+                    ColumnLineage(
+                        toColumn=to_column,
+                        fromColumns=["database.schema.orders.amount", "database.schema.orders.region"],
+                        function="sum((amount * rate)); (region = 'EU')",
+                    )
+                ],
+                "database.schema.fx": [
+                    ColumnLineage(
+                        toColumn=to_column, fromColumns=["database.schema.fx.rate"], function="sum((amount * rate))"
                     )
                 ],
             }

@@ -1129,9 +1129,79 @@ public class OpenLineageLineageResolutionIT {
             Entity.TOPIC, topic.getFullyQualifiedName(), schemaFqn + "." + outputName));
   }
 
+  /** ADR:2026-11-23-openlineage-input-transformations-are-the-column-lineage-function */
+  @Test
+  @Order(30)
+  void inputTransformations_areWrittenToTheColumnLineageFunction(TestNamespace ns)
+      throws Exception {
+    String suffix = uniqueSuffix();
+    String orders = "ol_cl_orders_" + suffix;
+    String customers = "ol_cl_customers_" + suffix;
+    String output = "ol_cl_output_" + suffix;
+    for (String name : List.of(orders, customers, output)) {
+      Tables.create().name(name).inSchema(schemaFqn).withColumns(DEFAULT_COLUMNS).execute();
+    }
+    List<Map<String, Object>> inputFields =
+        List.of(
+            transformedInputField(orders, "name", "DIRECT", "upper(name)"),
+            transformedInputField(customers, "id", "INDIRECT", "INNER JOIN ON (customer_id = id)"),
+            transformedInputField(orders, "id", "INDIRECT", "(id > 0)"));
+    Map<String, Object> columnLineage =
+        Map.of("fields", Map.of("name", Map.of("inputFields", inputFields)));
+
+    JsonNode response =
+        send(
+            completeEvent(ns.prefix("namespace"), ns.prefix("ol_cl_job_" + suffix))
+                .addInput("ecommerce_db.shopify." + orders, serviceName)
+                .addInput("ecommerce_db.shopify." + customers, serviceName)
+                .addOutput(
+                    Map.of(
+                        "namespace",
+                        serviceName,
+                        "name",
+                        "ecommerce_db.shopify." + output,
+                        "facets",
+                        Map.of("columnLineage", columnLineage))));
+
+    assertEquals("success", response.get("status").asText(), response.toString());
+    String toColumn = schemaFqn + "." + output + ".name";
+    assertEquals(
+        List.of(
+            columnEdge(
+                List.of(schemaFqn + "." + orders + ".name", schemaFqn + "." + orders + ".id"),
+                toColumn,
+                "upper(name); (id > 0)")),
+        fetchOpenLineageEdgeDetails(orders, output).get("columnsLineage"));
+    assertEquals(
+        List.of(
+            columnEdge(
+                List.of(schemaFqn + "." + customers + ".id"),
+                toColumn,
+                "INNER JOIN ON (customer_id = id)")),
+        fetchOpenLineageEdgeDetails(customers, output).get("columnsLineage"));
+  }
+
   // ====================================================================================
   // Helpers
   // ====================================================================================
+
+  private static Map<String, Object> transformedInputField(
+      String table, String field, String type, String description) {
+    return Map.of(
+        "namespace",
+        serviceName,
+        "name",
+        "ecommerce_db.shopify." + table,
+        "field",
+        field,
+        "transformations",
+        List.of(Map.of("type", type, "description", description)));
+  }
+
+  private static Map<String, Object> columnEdge(
+      List<String> fromColumns, String toColumn, String function) {
+    return Map.of("fromColumns", fromColumns, "toColumn", toColumn, "function", function);
+  }
 
   /**
    * Entity audit fields follow the entity contract, not the edge one: the principal that posted the

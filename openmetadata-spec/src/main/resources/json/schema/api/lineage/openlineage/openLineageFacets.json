@@ -94,6 +94,28 @@
         }
       }
     },
+    "inputFieldTransformation": {
+      "description": "How an input field contributes to an output field, as the OpenLineage column lineage facet (1-2-0) reports it.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "DIRECT when the output column's value is derived from the input field's value; INDIRECT when the output column's value is impacted by the input field's value but not derived from it.",
+          "type": "string"
+        },
+        "subtype": {
+          "description": "The kind of transformation, e.g. IDENTITY, TRANSFORMATION, AGGREGATION, JOIN, FILTER, GROUP_BY, SORT, WINDOW or CONDITIONAL.",
+          "type": "string"
+        },
+        "description": {
+          "description": "A string representation of the transformation applied.",
+          "type": "string"
+        },
+        "masking": {
+          "description": "Whether the transformation masks the input's values.",
+          "type": "boolean"
+        }
+      }
+    },
     "inputField": {
       "description": "A reference to an input column in column lineage.",
       "type": "object",
@@ -109,6 +131,13 @@
         "field": {
           "description": "The name of the input field/column.",
           "type": "string"
+        },
+        "transformations": {
+          "description": "The transformations through which this input field contributes to the output field.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/inputFieldTransformation"
+          }
         }
       },
       "required": ["namespace", "name", "field"]

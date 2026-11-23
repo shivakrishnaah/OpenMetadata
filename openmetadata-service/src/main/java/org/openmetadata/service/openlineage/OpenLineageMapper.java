@@ -333,29 +333,39 @@ public class OpenLineageMapper {
         continue;
       }
 
-      List<String> fromColumns = new ArrayList<>();
-      for (InputField inputField : fieldInfo.getInputFields()) {
-        String inputOlName =
-            buildOpenLineageDatasetName(inputField.getNamespace(), inputField.getName());
-        String inputFqn = inputNameToFqnMap.get(inputOlName);
-        if (inputFqn != null) {
-          String columnFqn = inputFqn + "." + inputField.getField();
-          fromColumns.add(columnFqn);
-        }
-      }
-
-      if (!fromColumns.isEmpty()) {
-        String toColumn = outputFqn + "." + outputColumnName;
-        ColumnLineage columnLineage =
-            new ColumnLineage()
-                .withFromColumns(fromColumns)
-                .withToColumn(toColumn)
-                .withFunction(fieldInfo.getTransformationDescription());
-        columnLineages.add(columnLineage);
-      }
+      String toColumn = outputFqn + "." + outputColumnName;
+      inputsByTable(fieldInfo, inputNameToFqnMap)
+          .forEach(
+              (inputFqn, inputs) ->
+                  columnLineages.add(
+                      new ColumnLineage()
+                          .withFromColumns(
+                              new ArrayList<>(
+                                  inputs.stream()
+                                      .map(input -> inputFqn + "." + input.getField())
+                                      .toList()))
+                          .withToColumn(toColumn)
+                          .withFunction(
+                              OpenLineageColumnFunction.of(
+                                  inputs, fieldInfo.getTransformationDescription()))));
     }
 
     return columnLineages;
+  }
+
+  /** The field's resolved inputs by table: one entry per input table, as each edge stores it. */
+  private static Map<String, List<InputField>> inputsByTable(
+      ColumnLineageField fieldInfo, Map<String, String> inputNameToFqnMap) {
+    Map<String, List<InputField>> inputsByTable = new LinkedHashMap<>();
+    for (InputField inputField : fieldInfo.getInputFields()) {
+      String inputOlName =
+          buildOpenLineageDatasetName(inputField.getNamespace(), inputField.getName());
+      String inputFqn = inputNameToFqnMap.get(inputOlName);
+      if (inputFqn != null) {
+        inputsByTable.computeIfAbsent(inputFqn, ignored -> new ArrayList<>()).add(inputField);
+      }
+    }
+    return inputsByTable;
   }
 
   private List<ColumnLineage> filterColumnLineageForInput(
