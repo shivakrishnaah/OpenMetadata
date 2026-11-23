@@ -269,6 +269,17 @@ def test_metric_stage_emits_metrics_with_assets_and_lineage(make_source):
     assert [column.root for column in margin_columns.fromColumns] == [f"{MODEL_FQN}.Fact Sales.Margin %"]
 
 
+def test_metric_lineage_function_is_the_measures_dax(make_source):
+    """A metric's column lineage carries its DAX as the function, as Tableau's carries its calculation."""
+    _, outputs = _run_workspace(make_source(), [SALES_DATASET])
+
+    edges = _edges(outputs)
+    for measure in (TOTAL_SALES, MARGIN):
+        metric = powerbi_metric_name(SERVICE, SALES_DATASET.id, measure.name)
+        column_lineage = edges[(MODEL_FQN, metric)].lineage_details.columnsLineage[0]
+        assert column_lineage.function.root == measure.expression
+
+
 def test_measures_stay_data_model_columns(make_source):
     """Metric ingestion is additive: the data model keeps every measure, hidden ones included."""
     datamodels, _ = _run_workspace(make_source(), [SALES_DATASET])

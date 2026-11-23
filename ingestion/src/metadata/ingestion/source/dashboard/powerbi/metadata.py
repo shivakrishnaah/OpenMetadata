@@ -54,6 +54,7 @@ from metadata.generated.schema.type.basic import (
     FullyQualifiedEntityName,
     Markdown,
     SourceUrl,
+    SqlFunction,
 )
 from metadata.generated.schema.type.entityLineage import ColumnLineage, LineageDetails
 from metadata.generated.schema.type.entityLineage import Source as LineageSource
@@ -2528,7 +2529,11 @@ class PowerbiSource(DashboardServiceSource):
                 lineage_details=LineageDetails(  # pyright: ignore[reportCallIssue]
                     source=LineageSource.DashboardLineage,
                     columnsLineage=[
-                        ColumnLineage(fromColumns=from_columns, toColumn=FullyQualifiedEntityName(metric_name))  # pyright: ignore[reportCallIssue]
+                        ColumnLineage(
+                            fromColumns=from_columns,
+                            toColumn=FullyQualifiedEntityName(metric_name),
+                            function=SqlFunction(measure.expression) if measure.expression else None,
+                        )  # pyright: ignore[reportCallIssue]
                     ]
                     if from_columns
                     else None,
