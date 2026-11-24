@@ -306,18 +306,40 @@ POSTGRES_ORDERS = PowerBiTable(
 )
 
 
+def _parsed_lineage(source: PowerbiSource, table: PowerBiTable) -> list[str]:
+    """The tables linked to the data model over every dbServicePrefixes entry, with the connector's own parsers."""
+    return [
+        linked
+        for prefix in source.get_db_service_prefixes() or [None]
+        for linked in _linked(
+            source._get_table_and_datamodel_lineage(db_service_prefix=prefix, table=table, datamodel_entity=DATA_MODEL)
+        )
+    ]
+
+
 def test_a_table_whose_source_no_parser_reads_links_by_name_under_a_schema_prefix(source):
     _catalog(
         source,
         [_table("pg.db.public.Orders"), _table("pg.db.other.Orders"), _table("mssql.sales.dbo.Orders")],
         prefixes=["pg.db.public"],
     )
-    assert _model_lineage(source, None, POSTGRES_ORDERS) == ["pg.db.public.Orders"]
+    assert _parsed_lineage(source, POSTGRES_ORDERS) == ["pg.db.public.Orders"]
 
 
 def test_a_table_whose_source_no_parser_reads_links_to_nothing_without_a_schema_prefix(source):
     _catalog(source, [_table("pg.db.public.Orders")], prefixes=["pg"])
-    assert _model_lineage(source, None, POSTGRES_ORDERS) == []
+    assert _parsed_lineage(source, POSTGRES_ORDERS) == []
+
+
+def test_a_reference_outside_the_prefix_does_not_stop_the_tables_other_references(source):
+    _catalog(source, [_table("mssql.sales.dbo.Orders"), _table("mssql.hr.dbo.Customers")], prefixes=["mssql.sales"])
+    outside = {"database": "hr", "schema": "dbo", "table": "Customers"}
+    assert _model_lineage(source, [outside, *QUALIFIED]) == ["mssql.sales.dbo.Orders"]
+
+
+def test_the_database_of_a_dataflow_reference_tells_two_tables_apart(source):
+    _catalog(source, [_table("mssql.hr.dbo.Orders")])
+    assert _dataflow_lineage(source, QUALIFIED) == []
 
 
 class _Unresolvable:

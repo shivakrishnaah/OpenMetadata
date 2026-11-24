@@ -1755,7 +1755,7 @@ class PowerbiSource(DashboardServiceSource):
     ) -> tuple[Table, str | None] | None:
         """
         The one table the reference names across the dbServicePrefixes (any service when none is set), with the
-        prefix it was found under. A reference without a schema, or matching several tables, resolves to none
+        prefix it was found under. A reference no prefix gives a schema, or matching several tables, resolves to none
         (ADR:2026-11-24-a-powerbi-table-links-only-to-the-one-warehouse-table-its-reference-names).
         """
         if not table:
@@ -1796,9 +1796,8 @@ class PowerbiSource(DashboardServiceSource):
             )
         if len(matches) > 1:
             logger.warning(
-                "Skipping table [%s]: %d tables match it (%s); set dbServicePrefixes to choose one",
+                "Skipping table [%s]: several tables match it (%s); set dbServicePrefixes to choose one",
                 table,
-                len(matches),
                 ", ".join(sorted(model_str(found.fullyQualifiedName) for found, _ in matches.values())),
             )
         return next(iter(matches.values())) if len(matches) == 1 else None
