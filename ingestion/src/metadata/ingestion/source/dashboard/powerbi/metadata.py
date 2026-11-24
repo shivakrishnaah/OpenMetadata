@@ -1727,12 +1727,8 @@ class PowerbiSource(DashboardServiceSource):
         """The warehouse table a Power BI source reference names, when it was found under this dbServicePrefixes entry."""
         key = (database, schema, table)
         if key not in self._resolved_source_tables:
-            try:
-                self._resolved_source_tables[key] = self._resolve_source_table(database, schema, table)
-            except Exception:
-                # Reported once, in the run that searched; the other prefixes' runs find no table
-                self._resolved_source_tables[key] = None
-                raise
+            # A failed search raises before anything is cached, so the next lookup searches again
+            self._resolved_source_tables[key] = self._resolve_source_table(database, schema, table)
         resolved = self._resolved_source_tables[key]
         return resolved[0] if resolved and resolved[1] == db_service_prefix else None
 

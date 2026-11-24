@@ -127,7 +127,7 @@ There are no limitations on the Datasets that are retrieved for creating lineage
 
 - `Disabled` (Use Non-Admin PowerBI APIs)
 Using the non-admin APIs will only fetch the dashboard and chart metadata from the workspaces that have the security group of the service principal assigned to them.
-Also lineage information can only be generated if the dataset is a <a href="https://learn.microsoft.com/en-us/rest/api/power-bi/push-datasets" target="_blank">Push Dataset</a>.
+Also lineage information can only be generated if the dataset is a <a href="https://learn.microsoft.com/en-us/rest/api/power-bi/push-datasets" target="_blank">Push Dataset</a>. A push dataset's tables carry no source, so each is looked up by its name and links only when **Database Service Prefixes** has a `service.database.schema` entry.
 For more information please visit the PowerBI official documentation <a href="https://learn.microsoft.com/en-us/rest/api/power-bi/push-datasets/datasets-get-tables#limitations" target="_blank">here</a>.
 
 $$

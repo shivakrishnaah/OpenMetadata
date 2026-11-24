@@ -27,9 +27,10 @@ shared table binding resolution.
 ## Decision
 
 - Both lookups, data model tables and dataflow entities, resolve a reference through
-  `_resolve_source_table`, the rule Hex and Sigma follow: across every `dbServicePrefixes` entry (every
-  database service when none is set), with the shared `TableBindingResolution` `SEARCH` lookup. When
-  a prefix names the service, that service's own resolution applies (BigQuery's sharded tables).
+  `_resolve_source_table`, the rule Hex follows (and Sigma, which takes no schema from a prefix):
+  across every `dbServicePrefixes` entry (every database service when none is set), with the shared
+  `TableBindingResolution` `SEARCH` lookup. When a prefix names the service, that service's own
+  resolution applies (BigQuery's sharded tables); without one, the default resolution does.
 - A reference is resolved only when its schema is known, from the source expression or from a
   prefix. SQL that does not qualify its tables (`FROM Orders`) resolves to none: its default schema
   is a session setting the connector cannot see.
@@ -41,9 +42,11 @@ shared table binding resolution.
   warning names them and asks for `dbServicePrefixes` to choose one.
 - The lineage stage runs once per prefix; a resolved table is linked only in the run of the prefix it
   was found under, so it gets one edge.
-- Each reference is resolved on its own: a failed search is reported as an error for that reference,
-  once, in the prefix run that searched, and the table's or dataflow's other references are still
-  linked. A name the FQN grammar rejects (a quote inside a quoted identifier) is skipped, as before.
+- Each reference is resolved on its own: a failed search is reported as an error for that reference
+  in each prefix run that searches it, and the table's or dataflow's other references are still
+  linked. A failure is never cached, so the next lookup of that reference searches again: a failed
+  read is not "no table". A name holding a double quote, which the FQN grammar rejects, is skipped,
+  as before.
 - A prefix is split as an FQN, so a quoted part holding a dot (`bq."google.com:proj".ds`) is one
   part; an entry that is not `service[.database[.schema[.table]]]` is skipped with a warning.
 
@@ -54,8 +57,11 @@ shared table binding resolution.
   only in form: the match is the one table of that name in a schema the user named as where Power BI
   reads from. Its cost is that a calculated or entered-data table named like a table in that schema
   (`Date`) links to it.
-- A wildcard reference (BigQuery's `events_2024*`) links nothing; it used to link one arbitrary
-  member.
+- With the default resolution a wildcard reference (BigQuery's `events_2024*`) links nothing, where
+  it used to link one arbitrary member. Under a prefix that names a BigQuery service, BigQuery's
+  resolution resolves a wildcard to its table family when that is the only match.
+- With Use Admin APIs off, every table comes from the push datasets API with no source, so every
+  table is looked up by its name and links only under a `service.database.schema` prefix.
 - A table that several services or databases hold gives no Power BI lineage until
   `dbServicePrefixes` narrows it to one, where it used to give an arbitrary one.
 - A table whose first reference does not match a prefix still links its other references; before,

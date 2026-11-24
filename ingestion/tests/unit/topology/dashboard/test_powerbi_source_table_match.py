@@ -170,7 +170,11 @@ def test_a_parsed_table_without_a_schema_links_to_nothing(source, caplog):
 
 
 def test_a_prefix_gives_the_schema_of_a_table_named_only_by_power_bi(source):
-    _catalog(source, [_table("mssql.sales.dbo.Orders")], prefixes=["mssql.sales.dbo"])
+    _catalog(
+        source,
+        [_table("mssql.sales.dbo.Orders"), _table("mssql.sales.staging.Orders"), _table("mssql.hr.dbo.Orders")],
+        prefixes=["mssql.sales.dbo"],
+    )
     assert _model_lineage(source, None) == ["mssql.sales.dbo.Orders"]
 
 
@@ -303,7 +307,11 @@ POSTGRES_ORDERS = PowerBiTable(
 
 
 def test_a_table_whose_source_no_parser_reads_links_by_name_under_a_schema_prefix(source):
-    _catalog(source, [_table("pg.db.public.Orders"), _table("mssql.sales.dbo.Orders")], prefixes=["pg.db.public"])
+    _catalog(
+        source,
+        [_table("pg.db.public.Orders"), _table("pg.db.other.Orders"), _table("mssql.sales.dbo.Orders")],
+        prefixes=["pg.db.public"],
+    )
     assert _model_lineage(source, None, POSTGRES_ORDERS) == ["pg.db.public.Orders"]
 
 
@@ -341,15 +349,22 @@ def test_a_reference_is_searched_once_per_prefix_over_every_prefix_run(source):
     assert len(searches) == 3
 
 
-def test_a_failed_search_is_reported_once_over_every_prefix_run(source):
-    _catalog(source, [], prefixes=["mssql", "pg", "other"])
+def test_a_search_that_failed_once_is_searched_again_for_the_next_data_model(source):
+    _catalog(source, [_table("mssql.sales.dbo.Orders")])
+    catalog_search = source.metadata.es_search_from_fqn
+    failures = iter([RuntimeError("search timed out")])
 
-    def search_down(**_):
-        raise RuntimeError("search is down")
+    def es_search_from_fqn(entity_type, fqn_search_string, **kwargs):
+        failure = next(failures, None)
+        if failure:
+            raise failure
+        return catalog_search(entity_type, fqn_search_string, **kwargs)
 
-    source.metadata.es_search_from_fqn = search_down
-    results = _model_results(source, QUALIFIED)
-    assert ["search is down" in either.left.error for either in results if either.left] == [True]
+    source.metadata.es_search_from_fqn = es_search_from_fqn
+    first = _model_results(source, QUALIFIED)
+    assert _linked(first) == []
+    assert ["search timed out" in either.left.error for either in first if either.left] == [True]
+    assert _model_lineage(source, QUALIFIED) == ["mssql.sales.dbo.Orders"]
 
 
 def test_a_quoted_prefix_part_holding_a_dot_is_one_part(source, caplog):
