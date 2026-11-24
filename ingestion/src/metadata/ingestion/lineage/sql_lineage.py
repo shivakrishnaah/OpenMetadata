@@ -17,8 +17,9 @@ import itertools
 import re
 import traceback
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from copy import deepcopy
+from dataclasses import replace
 from typing import Any, cast
 
 import networkx as nx
@@ -48,6 +49,7 @@ from metadata.generated.schema.entity.services.ingestionPipelines.status import 
 from metadata.generated.schema.metadataIngestion.parserconfig.queryParserConfig import (
     QueryParserType,
 )
+from metadata.generated.schema.type.basic import SqlFunction
 from metadata.generated.schema.type.entityLineage import (
     ColumnLineage,
     LineageDetails,
@@ -442,7 +444,8 @@ def get_column_lineage(
             to_column = _find_column(to_entity.columns, to_col)
             if from_column and to_column:
                 copied = copied_columns.copies(to_col, from_col)
-                column_lineage.extend(_nested_column_lineage(from_column, to_column, copied))
+                function = copied_columns.functions.get(to_col.lower())
+                column_lineage.extend(_nested_column_lineage(from_column, to_column, copied, function))
     for key, struct_pairs in sources.items():
         if key.startswith(f"{STRUCT_FIELD_PARENT}."):
             struct_name = key.removeprefix(f"{STRUCT_FIELD_PARENT}.")
@@ -457,12 +460,15 @@ def _find_column(columns: list[TableColumn] | None, name: str) -> TableColumn | 
     return next((column for column in columns or [] if column.name.root.lower() == name.lower()), None)
 
 
-def _nested_column_lineage(from_column: TableColumn, to_column: TableColumn, copied: bool) -> list[ColumnLineage]:
+def _nested_column_lineage(
+    from_column: TableColumn, to_column: TableColumn, copied: bool, function: str | None = None
+) -> list[ColumnLineage]:
     """
-    Lineage from one column to another and, when the query copies the column unchanged, one
-    edge per nested field the two share by name, at any depth: selecting a STRUCT or
-    ARRAY<STRUCT> as-is carries every field with it. A column built by an expression
-    (`STRUCT(billing AS address)`) keeps only the column edge: its fields may sit anywhere.
+    Lineage from one column to another, carrying the SQL `function` that computes the target when
+    the query computes it, and, when the query copies the column unchanged, one edge per nested
+    field the two share by name, at any depth: selecting a STRUCT or ARRAY<STRUCT> as-is carries
+    every field with it. A column built by an expression (`STRUCT(billing AS address)`) keeps only
+    the column edge: its fields may sit anywhere.
     """
     if not from_column.fullyQualifiedName or not to_column.fullyQualifiedName:
         return []
@@ -470,6 +476,7 @@ def _nested_column_lineage(from_column: TableColumn, to_column: TableColumn, cop
         ColumnLineage(
             fromColumns=[from_column.fullyQualifiedName],
             toColumn=to_column.fullyQualifiedName,
+            function=SqlFunction(function) if function else None,
         )
     ]
     for from_child in from_column.children or [] if copied else []:
@@ -812,8 +819,15 @@ def get_lineage_by_query(
         raw_column_lineage = lineage_parser.column_lineage
         column_lineage.update(populate_column_lineage_map(raw_column_lineage))
         _key_struct_field_parents(column_lineage, lineage_parser)
-        # Read the projections only when there is column lineage to follow into nested fields.
-        copied_columns = cast("CopiedColumns", lineage_parser.copied_columns) if column_lineage else NOTHING_COPIED
+        # Read the projections only when there is column lineage to follow into nested fields or write a function on.
+        copied_columns = (
+            replace(
+                cast("CopiedColumns", lineage_parser.copied_columns),
+                functions=cast("Mapping[str, str]", lineage_parser.column_functions),
+            )
+            if column_lineage
+            else NOTHING_COPIED
+        )
 
         for intermediate_table in lineage_parser.intermediate_tables:
             for source_table in lineage_parser.source_tables:

@@ -37,6 +37,10 @@ from collate_sqllineage.exceptions import SQLLineageException
 from collate_sqllineage.runner import LineageRunner
 from sqlglot import exp
 from sqlglot.dialects.dialect import DialectType
+from sqlglot.optimizer.eliminate_ctes import eliminate_ctes
+from sqlglot.optimizer.merge_subqueries import merge_subqueries
+from sqlglot.optimizer.qualify import qualify
+from sqlglot.optimizer.scope import Scope, build_scope
 from sqlparse.sql import Comparison, Identifier, Parenthesis, Statement
 
 from metadata.generated.schema.metadataIngestion.parserconfig.queryParserConfig import (
@@ -92,13 +96,15 @@ class CopiedColumns:
     `columns` maps an output name to the top-level columns it copies (`customer`, `u.customer`)
     and `fields` to the STRUCT fields it copies (`customer.address`), one per set-operation
     branch; `computed` holds the output names something else produces; `star` says a plain `*`
-    copies every other column under its own name.
+    copies every other column under its own name. `functions` maps an output name to the SQL
+    that computes it from the tables the query reads (`LineageParser.column_functions`).
     """
 
     columns: Mapping[str, frozenset[str]] = field(default_factory=dict)
     fields: Mapping[str, frozenset[str]] = field(default_factory=dict)
     computed: frozenset[str] = frozenset()
     star: bool = False
+    functions: Mapping[str, str] = field(default_factory=dict)
 
     def copies(self, to_col: str, from_col: str, *, struct_field: bool = False) -> bool:
         """
@@ -204,6 +210,64 @@ def _copied_columns(items: list[_Item]) -> CopiedColumns:
         else:
             (fields if is_field else columns)[name] = sources
     return CopiedColumns(columns=columns, fields=fields, computed=frozenset(computed), star=bool(stars) and all(stars))
+
+
+# How many CTEs or subqueries deep an output's expression is followed towards the tables it reads
+MAX_FUNCTION_DEPTH = 8
+
+
+def _computed_by(scope: Scope, column: exp.Column) -> tuple[exp.Expression, Scope] | None:
+    """What the CTE or subquery `column` reads computes for it, and that CTE's scope; None for a table's column"""
+    source = scope.sources.get(column.table) if column.table else None
+    if not isinstance(source, Scope) or not isinstance(source.expression, exp.Select):
+        return None
+    for projection in source.expression.expressions:
+        if projection.alias_or_name.lower() == column.name.lower():
+            return (projection.this if isinstance(projection, exp.Alias) else projection), source
+    return None
+
+
+def _read_from_tables(value: exp.Expression, scope: Scope, depth: int = 0) -> exp.Expression:
+    """`value` with each column it reads from a CTE or subquery replaced by what that computes, down to tables"""
+    if depth >= MAX_FUNCTION_DEPTH:
+        return value
+
+    def from_tables(node: exp.Expression) -> exp.Expression:
+        computed = _computed_by(scope, node) if isinstance(node, exp.Column) else None
+        return _read_from_tables(computed[0].copy(), computed[1], depth + 1) if computed else node
+
+    return value.transform(from_tables)
+
+
+def _column_functions(statement: exp.Expression, dialect: DialectType) -> dict[str, str]:
+    """
+    For each output a single SELECT computes, the SQL that computes it from the tables the query
+    reads, in `dialect`: CTEs and subqueries sqlglot can merge are merged, and a column read from
+    one it cannot (an aggregation) is replaced by the expression that computes it there. An output
+    that stays a plain column reference is a copy and has none, and a set operation has none.
+    """
+    body = statement.expression if isinstance(statement, (exp.Create, exp.Insert)) else statement
+    if not isinstance(body, exp.Select):
+        return {}
+    qualified = qualify(body.copy(), dialect=dialect, validate_qualify_columns=False, quote_identifiers=False)
+    select = eliminate_ctes(merge_subqueries(qualified))
+    scope = build_scope(select)
+    if scope is None:
+        return {}
+    # A target column list (`INSERT INTO t (a, b) SELECT ...`) names the outputs by position.
+    targets = statement.this.expressions if isinstance(statement.this, exp.Schema) else []
+    if targets and len(targets) != len(select.expressions):
+        return {}
+    functions: dict[str, str] = {}
+    for index, projection in enumerate(select.expressions):
+        if projection.is_star:
+            continue
+        value = _read_from_tables(projection.this if isinstance(projection, exp.Alias) else projection, scope)
+        if isinstance(value, exp.Column):
+            continue
+        name = targets[index].name if targets else projection.alias_or_name
+        functions[name.lower()] = value.sql(dialect=dialect)
+    return functions
 
 
 class LineageParser:
@@ -351,6 +415,26 @@ class LineageParser:
         body = statement.expression if isinstance(statement, (exp.Create, exp.Insert)) else statement
         items = _items(body)
         return NOTHING_COPIED if items is None else _copied_columns(items)
+
+    @cached_property
+    def column_functions(self) -> Mapping[str, str]:
+        """
+        For each output column the query's single statement computes, the SQL that computes it
+        from the tables it reads, as `_column_functions` builds it from the unmasked query; nothing
+        when the query cannot be read.
+        """
+        if self.parser is None or not self._clean_query:
+            return {}
+        dialect = _sqlglot_dialect(self.dialect)
+        try:
+            statements = timeout(seconds=self.timeout_seconds)(sqlglot.parse)(self._clean_query, dialect=dialect)
+            statements = [statement for statement in statements if statement is not None]
+            if len(statements) != 1:
+                return {}
+            return timeout(seconds=self.timeout_seconds)(_column_functions)(statements[0], dialect)
+        except Exception as err:
+            logger.debug("[%s] Cannot read the query's column functions: %s", self.query_hash, err)
+            return {}
 
     @cached_property
     def target_tables(self) -> list[Table | Location]:
