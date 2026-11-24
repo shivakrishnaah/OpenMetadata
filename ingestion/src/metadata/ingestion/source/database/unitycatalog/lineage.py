@@ -27,7 +27,7 @@ from metadata.generated.schema.api.lineage.addLineage import AddLineageRequest
 from metadata.generated.schema.entity.data.container import ContainerDataModel
 from metadata.generated.schema.entity.data.database import Database
 from metadata.generated.schema.entity.data.metric import Metric
-from metadata.generated.schema.entity.data.table import Table
+from metadata.generated.schema.entity.data.table import Table, TableType
 from metadata.generated.schema.entity.services.connections.database.unityCatalogConnection import (
     UnityCatalogConnection,
 )
@@ -92,12 +92,17 @@ LINEAGE_ROW_BUFFER_SIZE = 1000
 
 EMPTY_FUNCTIONS: Mapping[str, str] = MappingProxyType({})
 
+# A view's columns are computed by its definition, whatever statement last read it
+VIEW_TYPES = frozenset({TableType.View, TableType.MaterializedView, TableType.SecureView})
+
 
 @lru_cache(maxsize=256)
-def _statement_functions(sql_query: str) -> Mapping[str, str]:
-    """What the statement behind a target's lineage computes each output with, read once for all its upstreams"""
+def _statement_functions(sql_query: str, writes: str) -> Mapping[str, str]:
+    """What the statement computes each output of the table `writes` with, read once for all its upstreams"""
     cleaned = LineageParser.clean_raw_query(sql_query)
-    return MappingProxyType(dict(column_functions_of(cleaned, Dialect.DATABRICKS))) if cleaned else EMPTY_FUNCTIONS
+    if not cleaned:
+        return EMPTY_FUNCTIONS
+    return MappingProxyType(dict(column_functions_of(cleaned, Dialect.DATABRICKS, writes=writes)))
 
 
 class UnitycatalogLineageSource(Source):
@@ -510,6 +515,22 @@ class UnitycatalogLineageSource(Source):
             logger.debug(traceback.format_exc())
             return None
 
+    def _view_definition(self, table: Table) -> str | None:
+        """
+        A view's own definition, as the metadata agent stored it: the statement the system tables
+        give a view's edge is whatever query last read it, so it says nothing about its columns.
+        """
+        if table.tableType not in VIEW_TYPES or not table.fullyQualifiedName:
+            return None
+        try:
+            view = self.metadata.get_by_name(
+                entity=Table, fqn=table.fullyQualifiedName.root, fields=["schemaDefinition"]
+            )
+        except Exception as exc:
+            logger.debug(f"Could not read the definition of view {table.fullyQualifiedName.root}: {exc}")
+            return None
+        return model_str(view.schemaDefinition) if view and view.schemaDefinition else None
+
     def _get_column_lineage_details(
         self,
         from_table: Table,
@@ -517,11 +538,11 @@ class UnitycatalogLineageSource(Source):
         column_pairs: dict[tuple[str, str], None],
         sql_query: str | None = None,
     ) -> LineageDetails | None:
-        """The column pairs, each target carrying the SQL `sql_query` computes it with, when it computes it."""
+        """The column pairs, each target carrying the SQL `sql_query` computes it with when it writes `to_table`."""
         try:
             if not column_pairs:
                 return None
-            functions = _statement_functions(sql_query) if sql_query else EMPTY_FUNCTIONS
+            functions = _statement_functions(sql_query, to_table.name.root) if sql_query else EMPTY_FUNCTIONS
 
             col_lineage = []
             for source_col, target_col in column_pairs:
@@ -648,6 +669,7 @@ class UnitycatalogLineageSource(Source):
         upstream_columns: dict[str, dict[tuple[str, str], None]],
         upstream_sql: dict[str, str],
     ) -> Iterable[Either[AddLineageRequest]]:
+        definition = self._view_definition(table)
         for source_table_full_name in sorted(upstream_columns):
             # A table never derives from itself. The system tables record access rather
             # than derivation, so a streaming or CDC write legitimately names its target
@@ -664,7 +686,7 @@ class UnitycatalogLineageSource(Source):
                     from_table=from_entity,
                     to_table=table,
                     column_pairs=upstream_columns[source_table_full_name],
-                    sql_query=upstream_sql.get(source_table_full_name),
+                    sql_query=definition or upstream_sql.get(source_table_full_name),
                 ) or LineageDetails(source=LineageSource.QueryLineage)
 
                 if sql_query := upstream_sql.get(source_table_full_name):

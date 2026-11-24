@@ -21,7 +21,7 @@ import pytest
 
 from metadata.generated.schema.entity.data.table import Table
 from metadata.ingestion.lineage.models import Dialect
-from metadata.ingestion.lineage.parser import LineageParser
+from metadata.ingestion.lineage.parser import LineageParser, column_functions_of
 from metadata.ingestion.lineage.sql_lineage import get_lineage_by_query
 
 SERVICE = "dbx"
@@ -121,6 +121,7 @@ def test_a_view_column_carries_its_expression():
         pytest.param("INSERT INTO t SELECT a + 1 AS x FROM s1 UNION ALL SELECT b FROM s2", set(), id="union"),
         pytest.param("SELECT a + 1 AS x FROM s1; SELECT b FROM s2", set(), id="two statements"),
         pytest.param("this is not sql", set(), id="unreadable"),
+        pytest.param("SELECT upper(gender) AS gender FROM silver.member", set(), id="a select that only reads"),
     ],
 )
 def test_the_outputs_a_query_computes(query, expected):
@@ -142,4 +143,12 @@ def test_a_literal_is_kept_as_the_query_writes_it():
     query = "CREATE TABLE gold.g AS SELECT CASE WHEN gender = 'F' THEN 'Female' ELSE 'Other' END AS label FROM silver.member"
     assert LineageParser(query, Dialect.DATABRICKS).column_functions == {
         "label": "CASE WHEN member.gender = 'F' THEN 'Female' ELSE 'Other' END"
+    }
+
+
+def test_a_statement_that_writes_another_table_gives_none_for_the_target():
+    query = "CREATE TABLE gold.other AS SELECT upper(gender) AS gender FROM silver.member"
+    assert column_functions_of(query, Dialect.DATABRICKS, writes="main.gold.dim_member") == {}
+    assert column_functions_of(query, Dialect.DATABRICKS, writes="main.gold.other") == {
+        "gender": "UPPER(member.gender)"
     }

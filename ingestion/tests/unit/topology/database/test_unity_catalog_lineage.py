@@ -32,6 +32,7 @@ from metadata.generated.schema.entity.data.table import (
     ColumnName,
     DataType,
     Table,
+    TableType,
 )
 from metadata.generated.schema.metadataIngestion.workflow import (
     Source as WorkflowSource,
@@ -402,6 +403,68 @@ class TestNativeLineageStream:
             "svc.tgt.gender": "UPPER(TRIM(src.gender))",
             "svc.tgt.birth_date": None,
         }
+
+    def test_a_view_takes_its_functions_from_its_definition_not_from_a_query_that_read_it(self, lineage_source):
+        """Databricks names the last query that read a view; only its definition computes its columns"""
+        view = Table.model_validate(
+            {
+                **a_table("tgt", columns=[a_column("gender", "svc.tgt.gender")]).model_dump(),
+                "tableType": TableType.View,
+                "schemaDefinition": "CREATE VIEW cat.schema.tgt AS SELECT lower(gender) AS gender FROM cat.schema.src",
+            }
+        )
+        tables = {
+            "cat.schema.src": a_table("src", columns=[a_column("gender", "svc.src.gender")]),
+            "cat.schema.tgt": view,
+            "db.schema.tgt": view,
+        }
+        reading_query = "SELECT upper(gender) AS gender FROM cat.schema.tgt"
+
+        results = run(
+            lineage_source,
+            [
+                table_row(
+                    "cat.schema.src",
+                    "cat.schema.tgt",
+                    column_pairs=[("gender", "gender")],
+                    statement_text=reading_query,
+                )
+            ],
+            tables,
+        )
+
+        [pair] = results[0].right.edge.lineageDetails.columnsLineage
+        assert pair.function.root == "LOWER(src.gender)"
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            pytest.param("SELECT upper(gender) AS gender FROM cat.schema.tgt", id="a query that reads the target"),
+            pytest.param(
+                "CREATE TABLE cat.schema.other AS SELECT upper(gender) AS gender FROM cat.schema.src",
+                id="a statement that writes another table",
+            ),
+            pytest.param('spark.sql(f"CREATE OR REPLACE TABLE {GOLD}.{table} AS SELECT 1")', id="a notebook cell"),
+        ],
+    )
+    def test_a_statement_that_does_not_write_the_target_gives_it_no_function(self, lineage_source, statement):
+        tables = {
+            "cat.schema.src": a_table("src", columns=[a_column("gender", "svc.src.gender")]),
+            "cat.schema.tgt": a_table("tgt", columns=[a_column("gender", "svc.tgt.gender")]),
+        }
+
+        results = run(
+            lineage_source,
+            [
+                table_row(
+                    "cat.schema.src", "cat.schema.tgt", column_pairs=[("gender", "gender")], statement_text=statement
+                )
+            ],
+            tables,
+        )
+
+        [pair] = results[0].right.edge.lineageDetails.columnsLineage
+        assert pair.function is None
 
     def test_a_query_failure_emits_nothing(self, lineage_source):
         mock_conn = MagicMock()

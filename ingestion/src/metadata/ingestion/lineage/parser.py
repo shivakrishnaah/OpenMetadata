@@ -241,12 +241,16 @@ def _read_from_tables(value: exp.Expression, scope: Scope, depth: int = 0) -> ex
 
 def _column_functions(statement: exp.Expression, dialect: DialectType) -> dict[str, str]:
     """
-    For each output a single SELECT computes, the SQL that computes it from the tables the query
+    For each output a statement that writes a table or view (CREATE ... AS SELECT, INSERT ...
+    SELECT) computes with a single SELECT, the SQL that computes it from the tables the query
     reads, in `dialect`: CTEs and subqueries sqlglot can merge are merged, and a column read from
     one it cannot (an aggregation) is replaced by the expression that computes it there. An output
-    that stays a plain column reference is a copy and has none, and a set operation has none.
+    that stays a plain column reference is a copy and has none, and a set operation has none. A
+    statement that only reads (a bare SELECT) defines no column, so it has none.
     """
-    body = statement.expression if isinstance(statement, (exp.Create, exp.Insert)) else statement
+    if not isinstance(statement, (exp.Create, exp.Insert)):
+        return {}
+    body = statement.expression
     if not isinstance(body, exp.Select):
         return {}
     qualified = qualify(body.copy(), dialect=dialect, validate_qualify_columns=False, quote_identifiers=False)
@@ -270,20 +274,29 @@ def _column_functions(statement: exp.Expression, dialect: DialectType) -> dict[s
     return functions
 
 
+def _written_table(statement: exp.Expression) -> str | None:
+    """The name of the table or view a CREATE or INSERT writes, lower-cased"""
+    target = statement.this.this if isinstance(statement.this, exp.Schema) else statement.this
+    return target.name.lower() if isinstance(target, exp.Table) else None
+
+
 def column_functions_of(
-    query: str, dialect: Dialect, timeout_seconds: int = LINEAGE_PARSING_TIMEOUT
+    query: str, dialect: Dialect, timeout_seconds: int = LINEAGE_PARSING_TIMEOUT, writes: str | None = None
 ) -> Mapping[str, str]:
     """
     For each output column a query's single statement computes, the SQL that computes it from the
-    tables it reads (`_column_functions`); nothing when the query cannot be read. A source that has
-    the statement behind a lineage edge without parsing its lineage (Unity Catalog's system tables)
-    reads it here.
+    tables it reads (`_column_functions`); nothing when the query cannot be read, or when `writes`
+    names a table the statement does not write. A source that has the statement behind a lineage
+    edge without parsing its lineage (Unity Catalog's system tables) reads it here, naming the
+    edge's target in `writes`, since the statement it is given may write another table.
     """
     sqlglot_dialect = _sqlglot_dialect(dialect)
     try:
         statements = timeout(seconds=timeout_seconds)(sqlglot.parse)(query, dialect=sqlglot_dialect)
         statements = [statement for statement in statements if statement is not None]
         if len(statements) != 1:
+            return {}
+        if writes is not None and _written_table(statements[0]) != writes.rsplit(".", 1)[-1].lower():
             return {}
         return timeout(seconds=timeout_seconds)(_column_functions)(statements[0], sqlglot_dialect)
     except Exception as err:
