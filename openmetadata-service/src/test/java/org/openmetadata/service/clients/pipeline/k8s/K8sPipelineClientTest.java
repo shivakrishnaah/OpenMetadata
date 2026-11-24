@@ -2078,8 +2078,9 @@ class K8sPipelineClientTest {
     String longNameWithHyphen = "update-logger-level-for-test-pipeline-with-very-long-name-suffix-";
     String sanitized = client.sanitizeName(longNameWithHyphen);
 
-    // Should be truncated to 53 chars and NOT end with hyphen
-    assertTrue(sanitized.length() <= 53, "Sanitized name should be <= 53 chars");
+    // Should be shortened to fit "om-cronjob-" within a CronJob name's 52 chars, and NOT end with
+    // hyphen
+    assertTrue(sanitized.length() <= 41, "Sanitized name should be <= 41 chars");
     assertFalse(sanitized.endsWith("-"), "Sanitized name should not end with hyphen");
     assertTrue(
         sanitized.matches("^[a-z0-9][a-z0-9-]*[a-z0-9]$"),
@@ -2113,12 +2114,51 @@ class K8sPipelineClientTest {
 
   @Test
   void testSanitizeName_EnsuresMaxLength() {
-    // Create a name longer than 53 chars that ends with alphanumeric
+    // Create a name longer than a CronJob name leaves room for
     String veryLongName = "a".repeat(60);
     String sanitized = client.sanitizeName(veryLongName);
 
-    assertTrue(sanitized.length() <= 53, "Should truncate to max 53 chars");
-    assertEquals(53, sanitized.length(), "Should use full 53 chars when possible");
+    assertEquals(41, sanitized.length(), "Should use the full 41 chars when possible");
+    assertTrue(sanitized.matches("^a{32}-[0-9a-f]{8}$"), "Should keep the start and add a hash");
+  }
+
+  @Test
+  void testSanitizeName_LongNamesSharingAStartStayApart() {
+    String prefix =
+        "dq_run__warehouse_service_0f3e9c2a_7b41_4d8e_a5c6_d2f1e0b9a8c7_analytics_gold_";
+    String first = client.sanitizeName(prefix + "orders_exceptions__5c1d9e7a");
+    String second = client.sanitizeName(prefix + "orders_exceptions_history__93b4e2f0");
+
+    assertNotEquals(first, second, "Names that share a start must not share a Kubernetes name");
+    assertEquals(first, client.sanitizeName(prefix + "orders_exceptions__5c1d9e7a"));
+  }
+
+  @Test
+  void testDeployPipeline_LongNameCronJobFitsTheCronJobNameLimit() throws Exception {
+    IngestionPipeline pipeline =
+        createTestPipeline(
+            "dq_run__warehouse_service_0f3e9c2a_7b41_4d8e_a5c6_d2f1e0b9a8c7_analytics_gold_orders_exceptions__5c1d9e7a",
+            "0 * * * *");
+    when(coreApi.readNamespacedConfigMap(any(), eq(NAMESPACE))).thenReturn(readConfigMapRequest);
+    when(readConfigMapRequest.execute()).thenThrow(new ApiException(404, "Not found"));
+    when(coreApi.createNamespacedConfigMap(eq(NAMESPACE), any()))
+        .thenReturn(createConfigMapRequest);
+    when(createConfigMapRequest.execute()).thenReturn(new V1ConfigMap());
+    when(coreApi.readNamespacedSecret(any(), eq(NAMESPACE))).thenReturn(readSecretRequest);
+    when(readSecretRequest.execute()).thenThrow(new ApiException(404, "Not found"));
+    when(coreApi.createNamespacedSecret(eq(NAMESPACE), any())).thenReturn(createSecretRequest);
+    when(createSecretRequest.execute()).thenReturn(new V1Secret());
+    when(batchApi.readNamespacedCronJob(any(), eq(NAMESPACE))).thenReturn(readCronJobRequest);
+    when(readCronJobRequest.execute()).thenThrow(new ApiException(404, "Not found"));
+    when(batchApi.createNamespacedCronJob(eq(NAMESPACE), any())).thenReturn(createCronJobRequest);
+    when(createCronJobRequest.execute()).thenReturn(new V1CronJob());
+
+    assertEquals(200, client.deployPipeline(pipeline, testService).getCode());
+
+    ArgumentCaptor<V1CronJob> cronJobCaptor = ArgumentCaptor.forClass(V1CronJob.class);
+    verify(batchApi).createNamespacedCronJob(eq(NAMESPACE), cronJobCaptor.capture());
+    String name = cronJobCaptor.getValue().getMetadata().getName();
+    assertTrue(name.length() <= 52, "A CronJob name is at most 52 chars, got " + name);
   }
 
   @Test

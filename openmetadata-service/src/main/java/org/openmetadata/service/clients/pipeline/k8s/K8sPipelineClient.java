@@ -63,6 +63,7 @@ import lombok.extern.slf4j.Slf4j;
 import okhttp3.HttpUrl;
 import okhttp3.Request;
 import okhttp3.Response;
+import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.openmetadata.schema.ServiceEntityInterface;
 import org.openmetadata.schema.api.configuration.pipelineServiceClient.PipelineServiceClientConfiguration;
@@ -177,6 +178,10 @@ public class K8sPipelineClient extends PipelineServiceClient {
   private static final String NAMESPACE_PREFIX = " in namespace: ";
   private static final String KUBERNETES_CLUSTER_PREFIX = "Kubernetes cluster - namespace: ";
   private static final int KUBERNETES_NAME_MAX_LENGTH = 63;
+  // A CronJob name is at most 52 characters, and its prefix is the longest one a pipeline name
+  // takes
+  private static final int PIPELINE_NAME_MAX_LENGTH = 52 - CRONJOB_PREFIX.length();
+  private static final int PIPELINE_NAME_HASH_LENGTH = 8;
   private static final String KUBERNETES_CLUSTER = "Kubernetes cluster";
   private static final String NO_LOGS_MESSAGE = "No logs available for pod: ";
   private static final String NO_PODS_MESSAGE = "No pods found for this pipeline";
@@ -2387,12 +2392,20 @@ public class K8sPipelineClient extends PipelineServiceClient {
             .replaceAll("-+", "-")
             .replaceAll("^-+|-+$", "");
 
-    if (sanitized.length() > 53) { // Leave room for prefixes
-      sanitized = sanitized.substring(0, 53).replaceAll("-+$", "");
-    }
-
     if (!sanitized.matches("^[a-z0-9].*")) {
       sanitized = "p-" + sanitized;
+    }
+
+    // A long name keeps its start and gains a hash of the whole name, so names sharing a start stay
+    // apart
+    if (sanitized.length() > PIPELINE_NAME_MAX_LENGTH) {
+      String hash = DigestUtils.sha256Hex(name).substring(0, PIPELINE_NAME_HASH_LENGTH);
+      sanitized =
+          sanitized
+                  .substring(0, PIPELINE_NAME_MAX_LENGTH - PIPELINE_NAME_HASH_LENGTH - 1)
+                  .replaceAll("-+$", "")
+              + "-"
+              + hash;
     }
 
     return sanitized;
