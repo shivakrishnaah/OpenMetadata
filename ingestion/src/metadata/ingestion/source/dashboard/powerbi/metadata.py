@@ -140,6 +140,19 @@ PBIT_WORKSPACE_ID = "pbit-files"
 
 ListedItemT = TypeVar("ListedItemT")
 
+
+def _navigation_step(kind: str) -> re.Pattern[str]:
+    """M's navigation step `[Name="<name>",Kind="<kind>"]`, however it is spaced: the name quoted, or a parameter."""
+    return re.compile(rf'\[\s*Name\s*=\s*(?:"([^"]+)"|([^,\]]+?))\s*,\s*Kind\s*=\s*"{kind}"\s*\]')
+
+
+DATABASE_STEP = _navigation_step("Database")
+SCHEMA_STEP = _navigation_step("Schema")
+TABLE_STEP = _navigation_step("Table")
+VIEW_STEP = _navigation_step("View")
+# BigQuery's steps name the project with no Kind: `[Name="project"]`
+BIGQUERY_STEP = re.compile(r'\[\s*Name\s*=\s*"([^"]+)"\s*(?:,\s*Kind\s*=\s*"([^"]+)"\s*)?\]')
+
 # Distinct warehouse table references resolved per run; past it a reference is searched again
 MAX_RESOLVED_SOURCE_TABLES = 1_000
 
@@ -1228,8 +1241,8 @@ class PowerbiSource(DashboardServiceSource):
 
             if "Snowflake.Databases" in source_expression:
                 # snowflake expression
-                table_match = re.search(r'\[Name=(?:"([^"]+)"|([^,]+)),Kind="Table"\]', source_expression)
-                view_match = re.search(r'\[Name=(?:"([^"]+)"|([^,]+)),Kind="View"\]', source_expression)
+                table_match = TABLE_STEP.search(source_expression)
+                view_match = VIEW_STEP.search(source_expression)
                 table = table_match.group(1) if table_match else None
                 view = view_match.group(1) if view_match else None
                 return table if table else view
@@ -1444,7 +1457,7 @@ class PowerbiSource(DashboardServiceSource):
             # Pattern: [Name="project"][Data][Name="dataset",Kind="Schema"][Data][Name="table",Kind="Table"]
 
             # Extract all Name= patterns
-            name_matches = re.findall(r'\[Name="([^"]+)"(?:,Kind="([^"]+)")?\]', source_expression)
+            name_matches = BIGQUERY_STEP.findall(source_expression)
 
             if not name_matches:
                 logger.debug(
@@ -1617,10 +1630,10 @@ class PowerbiSource(DashboardServiceSource):
         self, source_expression: str, datamodel_entity: DashboardDataModel
     ) -> list[dict] | None:
         """parse catalog table definition"""
-        db_match = re.search(r'\[Name=(?:"([^"]+)"|([^,]+)),Kind="Database"\]', source_expression)
-        schema_match = re.search(r'\[Name=(?:"([^"]+)"|([^,]+)),Kind="Schema"\]', source_expression)
-        table_match = re.search(r'\[Name=(?:"([^"]+)"|([^,]+)),Kind="Table"\]', source_expression)
-        view_match = re.search(r'\[Name=(?:"([^"]+)"|([^,]+)),Kind="View"\]', source_expression)
+        db_match = DATABASE_STEP.search(source_expression)
+        schema_match = SCHEMA_STEP.search(source_expression)
+        table_match = TABLE_STEP.search(source_expression)
+        view_match = VIEW_STEP.search(source_expression)
         try:
             database = self._parse_expression_regex_exp(db_match, datamodel_entity)
             schema = self._parse_expression_regex_exp(schema_match, datamodel_entity)
