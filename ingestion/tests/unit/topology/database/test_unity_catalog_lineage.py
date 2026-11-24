@@ -368,6 +368,41 @@ class TestNativeLineageStream:
             ("svc.src.col_b", "svc.tgt.col_y"),
         ]
 
+    def test_a_column_the_statement_computes_carries_its_sql(self, lineage_source):
+        """The statement Databricks ran is read for what computes each target column; a copy has none"""
+        tables = {
+            "cat.schema.src": a_table(
+                "src", columns=[a_column("gender", "svc.src.gender"), a_column("birth_date", "svc.src.birth_date")]
+            ),
+            "cat.schema.tgt": a_table(
+                "tgt", columns=[a_column("gender", "svc.tgt.gender"), a_column("birth_date", "svc.tgt.birth_date")]
+            ),
+        }
+        statement = (
+            "CREATE OR REPLACE TABLE cat.schema.tgt AS "
+            "WITH m AS (SELECT upper(trim(gender)) AS gender, birth_date FROM cat.schema.src) "
+            "SELECT m.gender, m.birth_date FROM m"
+        )
+
+        results = run(
+            lineage_source,
+            [
+                table_row(
+                    "cat.schema.src",
+                    "cat.schema.tgt",
+                    column_pairs=[("gender", "gender"), ("birth_date", "birth_date")],
+                    statement_text=statement,
+                )
+            ],
+            tables,
+        )
+
+        columns_lineage = results[0].right.edge.lineageDetails.columnsLineage
+        assert {pair.toColumn.root: pair.function.root if pair.function else None for pair in columns_lineage} == {
+            "svc.tgt.gender": "UPPER(TRIM(src.gender))",
+            "svc.tgt.birth_date": None,
+        }
+
     def test_a_query_failure_emits_nothing(self, lineage_source):
         mock_conn = MagicMock()
         mock_conn.execution_options.return_value = mock_conn

@@ -270,6 +270,27 @@ def _column_functions(statement: exp.Expression, dialect: DialectType) -> dict[s
     return functions
 
 
+def column_functions_of(
+    query: str, dialect: Dialect, timeout_seconds: int = LINEAGE_PARSING_TIMEOUT
+) -> Mapping[str, str]:
+    """
+    For each output column a query's single statement computes, the SQL that computes it from the
+    tables it reads (`_column_functions`); nothing when the query cannot be read. A source that has
+    the statement behind a lineage edge without parsing its lineage (Unity Catalog's system tables)
+    reads it here.
+    """
+    sqlglot_dialect = _sqlglot_dialect(dialect)
+    try:
+        statements = timeout(seconds=timeout_seconds)(sqlglot.parse)(query, dialect=sqlglot_dialect)
+        statements = [statement for statement in statements if statement is not None]
+        if len(statements) != 1:
+            return {}
+        return timeout(seconds=timeout_seconds)(_column_functions)(statements[0], sqlglot_dialect)
+    except Exception as err:
+        logger.debug("Cannot read the query's column functions: %s", err)
+        return {}
+
+
 class LineageParser:
     """
     Class that acts like a wrapper for the LineageRunner library usage
@@ -418,23 +439,10 @@ class LineageParser:
 
     @cached_property
     def column_functions(self) -> Mapping[str, str]:
-        """
-        For each output column the query's single statement computes, the SQL that computes it
-        from the tables it reads, as `_column_functions` builds it from the unmasked query; nothing
-        when the query cannot be read.
-        """
+        """`column_functions_of` the unmasked query; nothing when the lineage parser could not read it."""
         if self.parser is None or not self._clean_query:
             return {}
-        dialect = _sqlglot_dialect(self.dialect)
-        try:
-            statements = timeout(seconds=self.timeout_seconds)(sqlglot.parse)(self._clean_query, dialect=dialect)
-            statements = [statement for statement in statements if statement is not None]
-            if len(statements) != 1:
-                return {}
-            return timeout(seconds=self.timeout_seconds)(_column_functions)(statements[0], dialect)
-        except Exception as err:
-            logger.debug("[%s] Cannot read the query's column functions: %s", self.query_hash, err)
-            return {}
+        return column_functions_of(self._clean_query, self.dialect, self.timeout_seconds)
 
     @cached_property
     def target_tables(self) -> list[Table | Location]:

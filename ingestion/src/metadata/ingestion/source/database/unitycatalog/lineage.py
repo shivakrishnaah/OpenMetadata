@@ -15,7 +15,9 @@ Databricks Unity Catalog Lineage Source Module
 import json
 import traceback
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from functools import lru_cache
+from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
 
 from cachetools import LRUCache
@@ -35,7 +37,7 @@ from metadata.generated.schema.metadataIngestion.databaseServiceQueryLineagePipe
 from metadata.generated.schema.metadataIngestion.workflow import (
     Source as WorkflowSource,
 )
-from metadata.generated.schema.type.basic import SqlQuery
+from metadata.generated.schema.type.basic import SqlFunction, SqlQuery
 from metadata.generated.schema.type.entityLineage import (
     ColumnLineage,
     EntitiesEdge,
@@ -45,6 +47,8 @@ from metadata.generated.schema.type.entityLineage import Source as LineageSource
 from metadata.generated.schema.type.entityReference import EntityReference
 from metadata.ingestion.api.models import Either
 from metadata.ingestion.api.steps import InvalidSourceException, Source
+from metadata.ingestion.lineage.models import Dialect
+from metadata.ingestion.lineage.parser import LineageParser, column_functions_of
 from metadata.ingestion.lineage.sql_lineage import get_column_fqn
 from metadata.ingestion.ometa.ometa_api import OpenMetadata
 from metadata.ingestion.ometa.utils import model_str
@@ -84,6 +88,16 @@ logger = ingestion_logger()
 
 TABLE_CACHE_MAX_SIZE = 500
 LINEAGE_ROW_BUFFER_SIZE = 1000
+
+
+EMPTY_FUNCTIONS: Mapping[str, str] = MappingProxyType({})
+
+
+@lru_cache(maxsize=256)
+def _statement_functions(sql_query: str) -> Mapping[str, str]:
+    """What the statement behind a target's lineage computes each output with, read once for all its upstreams"""
+    cleaned = LineageParser.clean_raw_query(sql_query)
+    return MappingProxyType(dict(column_functions_of(cleaned, Dialect.DATABRICKS))) if cleaned else EMPTY_FUNCTIONS
 
 
 class UnitycatalogLineageSource(Source):
@@ -501,17 +515,27 @@ class UnitycatalogLineageSource(Source):
         from_table: Table,
         to_table: Table,
         column_pairs: dict[tuple[str, str], None],
+        sql_query: str | None = None,
     ) -> LineageDetails | None:
+        """The column pairs, each target carrying the SQL `sql_query` computes it with, when it computes it."""
         try:
             if not column_pairs:
                 return None
+            functions = _statement_functions(sql_query) if sql_query else EMPTY_FUNCTIONS
 
             col_lineage = []
             for source_col, target_col in column_pairs:
                 from_col_fqn = get_column_fqn(from_table, source_col)
                 to_col_fqn = get_column_fqn(to_table, target_col)
                 if from_col_fqn and to_col_fqn and from_col_fqn != to_col_fqn:
-                    col_lineage.append(ColumnLineage(fromColumns=[from_col_fqn], toColumn=to_col_fqn))
+                    function = functions.get(target_col.lower())
+                    col_lineage.append(
+                        ColumnLineage(
+                            fromColumns=[from_col_fqn],
+                            toColumn=to_col_fqn,
+                            function=SqlFunction(function) if function else None,
+                        )
+                    )
 
             if col_lineage:
                 return LineageDetails(columnsLineage=col_lineage, source=LineageSource.QueryLineage)
@@ -640,6 +664,7 @@ class UnitycatalogLineageSource(Source):
                     from_table=from_entity,
                     to_table=table,
                     column_pairs=upstream_columns[source_table_full_name],
+                    sql_query=upstream_sql.get(source_table_full_name),
                 ) or LineageDetails(source=LineageSource.QueryLineage)
 
                 if sql_query := upstream_sql.get(source_table_full_name):
