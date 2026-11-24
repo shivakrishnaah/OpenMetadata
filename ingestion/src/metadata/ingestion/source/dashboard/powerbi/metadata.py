@@ -16,11 +16,17 @@ from collections import Counter
 from collections.abc import Callable, Iterable
 from copy import deepcopy
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Any, TypeVar
 
+from antlr4.error.Errors import ParseCancellationException
+from cachetools import LRUCache
 from pydantic import EmailStr
 from pydantic_core import PydanticCustomError
 
+from metadata.domain.table_reference import TableReference
+from metadata.entity_resolution.table_binding import TableLookup, UnsupportedTableReferenceError
+from metadata.entity_resolution.table_search import get_table_binding_resolution
 from metadata.generated.schema.api.data.createChart import CreateChartRequest
 from metadata.generated.schema.api.data.createDashboard import CreateDashboardRequest
 from metadata.generated.schema.api.data.createDashboardDataModel import (
@@ -124,7 +130,6 @@ from metadata.utils.filters import (
     filter_by_dashboard,
     filter_by_datamodel,
 )
-from metadata.utils.fqn import build_es_fqn_search_string
 from metadata.utils.helpers import clean_uri
 from metadata.utils.logger import ingestion_logger
 
@@ -134,6 +139,9 @@ logger = ingestion_logger()
 PBIT_WORKSPACE_ID = "pbit-files"
 
 ListedItemT = TypeVar("ListedItemT")
+
+# Distinct warehouse table references resolved per run; past it a reference is searched again
+MAX_RESOLVED_SOURCE_TABLES = 1_000
 
 
 @dataclass(frozen=True)
@@ -174,6 +182,10 @@ class PowerbiSource(DashboardServiceSource):
         self.pagination_entity_per_page = min(100, self.service_connection.pagination_entity_per_page)
         self.datamodel_file_mappings = []
         self.state = WorkspaceState()
+        # The lineage stage runs once per dbServicePrefixes entry, and each run needs every prefix's match
+        self._resolved_source_tables: LRUCache[
+            tuple[str | None, str | None, str | None], tuple[Table, str | None] | None
+        ] = LRUCache(maxsize=MAX_RESOLVED_SOURCE_TABLES)
         if self.source_config.includeMetrics and not self.source_config.includeDataModels:
             logger.warning(
                 "includeMetrics is enabled but includeDataModels is disabled: measures are read "
@@ -1709,6 +1721,92 @@ class PowerbiSource(DashboardServiceSource):
             logger.debug(traceback.format_exc())
         return None
 
+    def _source_table(
+        self, database: str | None, schema: str | None, table: str | None, db_service_prefix: str | None
+    ) -> Table | None:
+        """The warehouse table a Power BI source reference names, when it was found under this dbServicePrefixes entry."""
+        key = (database, schema, table)
+        if key not in self._resolved_source_tables:
+            try:
+                self._resolved_source_tables[key] = self._resolve_source_table(database, schema, table)
+            except Exception:
+                # Reported once, in the run that searched; the other prefixes' runs find no table
+                self._resolved_source_tables[key] = None
+                raise
+        resolved = self._resolved_source_tables[key]
+        return resolved[0] if resolved and resolved[1] == db_service_prefix else None
+
+    @cached_property
+    def _source_table_prefixes(self) -> list[tuple[str | None, tuple[str | None, str | None, str | None, str | None]]]:
+        """Each dbServicePrefixes entry with its service, database, schema and table parts, or one unscoped entry."""
+        prefixes: list[tuple[str | None, tuple[str | None, str | None, str | None, str | None]]] = []
+        for prefix in self.get_db_service_prefixes() or [None]:
+            try:
+                parts = [fqn.unquote_name(part) for part in fqn.split(prefix)] if prefix else []
+            except ParseCancellationException:
+                parts = None
+            if parts is None or len(parts) > 4:
+                logger.warning(
+                    "Skipping dbServicePrefixes entry [%s]: it is not service[.database[.schema[.table]]]", prefix
+                )
+                continue
+            service, database, schema, table = (*parts, *[None] * (4 - len(parts)))
+            prefixes.append((prefix, (service, database, schema, table)))
+        return prefixes
+
+    def _resolve_source_table(
+        self, database: str | None, schema: str | None, table: str | None
+    ) -> tuple[Table, str | None] | None:
+        """
+        The one table the reference names across the dbServicePrefixes (any service when none is set), with the
+        prefix it was found under. A reference without a schema, or matching several tables, resolves to none
+        (ADR:2026-11-24-a-powerbi-table-links-only-to-the-one-warehouse-table-its-reference-names).
+        """
+        if not table:
+            return None
+        try:
+            for name in (database, schema, table):
+                if name:
+                    fqn.quote_name(name)
+        except ValueError:
+            logger.debug("Skipping table '%s' with invalid FQN characters", table)
+            return None
+        matches: dict[str, tuple[Table, str | None]] = {}
+        searched, schemaless = False, False
+        for prefix, (service, prefix_database, prefix_schema, prefix_table) in self._source_table_prefixes:
+            if any(
+                expected and actual and expected.lower() != actual.lower()
+                for expected, actual in ((prefix_database, database), (prefix_schema, schema), (prefix_table, table))
+            ):
+                continue
+            if not (schema or prefix_schema):
+                schemaless = True
+                continue
+            searched = True
+            try:
+                found_tables = get_table_binding_resolution(self.metadata, service).resolve(
+                    TableReference(database or prefix_database, schema or prefix_schema, table),
+                    service_name=service,
+                    lookup=TableLookup.SEARCH,
+                )
+            except UnsupportedTableReferenceError as exc:
+                logger.debug("Skipping unsupported Power BI table reference %s in %s: %s", table, service, exc)
+                continue
+            for found in found_tables:
+                matches.setdefault(model_str(found.id), (found, prefix))
+        if schemaless and not searched:
+            logger.info(
+                "Skipping table [%s]: its schema is unknown; a dbServicePrefixes entry with a schema links it", table
+            )
+        if len(matches) > 1:
+            logger.warning(
+                "Skipping table [%s]: %d tables match it (%s); set dbServicePrefixes to choose one",
+                table,
+                len(matches),
+                ", ".join(sorted(model_str(found.fullyQualifiedName) for found, _ in matches.values())),
+            )
+        return next(iter(matches.values())) if len(matches) == 1 else None
+
     def _get_table_and_datamodel_lineage(
         self,
         db_service_prefix: str | None,
@@ -1721,66 +1819,40 @@ class PowerbiSource(DashboardServiceSource):
 
         ``model_tables`` are all the tables of the data model, for its calculated columns that read ``table``.
         """
-        (
-            prefix_service_name,
-            prefix_database_name,
-            prefix_schema_name,
-            prefix_table_name,
-        ) = self.parse_db_service_prefix(db_service_prefix)
-
         try:
             table_info_list = self._parse_table_info_from_source_exp(table, datamodel_entity)
             if not table_info_list:
                 # if tables are not found from source expression
-                # try establishing lineage using powerbi's table name.
-                # PowerBiTable.name is now Optional, so skip nameless tables here
-                # to match _get_column_info and avoid build_es_fqn_search_string
-                # raising on a None table_name (which surfaces as a noisy lineage
-                # error rather than a quiet skip).
+                # try establishing lineage using powerbi's table name, which links
+                # only when a dbServicePrefixes entry gives its schema.
+                # PowerBiTable.name is Optional, so skip nameless tables as _get_column_info does.
                 if not table.name:
                     logger.debug(
                         "Skipping PowerBI table with empty name for lineage to datamodel [%s]",
-                        datamodel_entity.name,
+                        model_str(datamodel_entity.name),
                     )
                     return
                 table_info_list = [{"table": table.name}]
             if isinstance(table_info_list, list):
                 for table_info in table_info_list:
                     table_name = table_info.get("table") or table.name
-                    schema_name = table_info.get("schema")
-                    database_name = table_info.get("database")
-                    if prefix_table_name and table_name and prefix_table_name.lower() != table_name.lower():
-                        logger.debug(f"Table {table_name} does not match prefix {prefix_table_name}")
-                        return
-
-                    if prefix_schema_name and schema_name and prefix_schema_name.lower() != schema_name.lower():
-                        logger.debug(f"Schema {table_info.get('schema')} does not match prefix {prefix_schema_name}")
-                        return
-
-                    if prefix_database_name and database_name and prefix_database_name.lower() != database_name.lower():
-                        logger.debug(
-                            f"Database {table_info.get('database')} does not match prefix {prefix_database_name}"
-                        )
-                        return
-
                     try:
-                        fqn_search_string = build_es_fqn_search_string(
-                            service_name=prefix_service_name or "*",
-                            table_name=(prefix_table_name or table_name),
-                            schema_name=(prefix_schema_name or schema_name),
-                            database_name=(prefix_database_name or database_name),
+                        table_entity = self._source_table(
+                            table_info.get("database"), table_info.get("schema"), table_name, db_service_prefix
                         )
-                    except ValueError:
-                        logger.debug(f"Skipping table '{table_name}' with invalid FQN characters")
+                    except Exception as exc:  # pylint: disable=broad-except
+                        yield Either(  # pyright: ignore[reportCallIssue]
+                            left=StackTraceError(
+                                name="DataModel Lineage",
+                                error=f"Error resolving table [{table_name}] of datamodel [{model_str(datamodel_entity.name)}]: {exc}",
+                                stackTrace=traceback.format_exc(),
+                            )
+                        )
                         continue
-                    table_entity = self.metadata.search_in_any_service(
-                        entity_type=Table,
-                        fqn_search_string=fqn_search_string,
-                    )
                     if table_entity and datamodel_entity:
                         logger.debug(
                             "Creating lineage between db table=%s and datamodel=%s",
-                            table_entity.name.root,  # pyright: ignore[reportAttributeAccessIssue]
+                            table_entity.name.root,
                             datamodel_entity.name.root,
                         )
                         columns_list = [
@@ -2268,13 +2340,6 @@ class PowerbiSource(DashboardServiceSource):
         by parsing the Power Query M document from the dataflow export.
         Also creates column-level lineage where column names match.
         """
-        (
-            prefix_service_name,
-            prefix_database_name,
-            prefix_schema_name,
-            prefix_table_name,
-        ) = self.parse_db_service_prefix(db_service_prefix)
-
         try:
             parsed_entities = self._parse_dataflow_m_document(dataflow_export)
             if not parsed_entities:
@@ -2301,35 +2366,22 @@ class PowerbiSource(DashboardServiceSource):
                 sql_query = parsed_entity.get("sql")
 
                 for table_info in parsed_entity.get("tables", []):
-                    table_name = table_info.get("table")
-                    schema_name = table_info.get("schema")
-                    database_name = table_info.get("database")
-
-                    if not table_name:
-                        continue
-
-                    if prefix_table_name and table_name and prefix_table_name.lower() != table_name.lower():
-                        continue
-
-                    if prefix_schema_name and schema_name and prefix_schema_name.lower() != schema_name.lower():
-                        continue
-
-                    if prefix_database_name and database_name and prefix_database_name.lower() != database_name.lower():
-                        continue
                     try:
-                        fqn_search_string = build_es_fqn_search_string(
-                            service_name=prefix_service_name or "*",
-                            table_name=prefix_table_name or table_name,
-                            schema_name=prefix_schema_name or schema_name,
-                            database_name=prefix_database_name or database_name,
+                        table_entity = self._source_table(
+                            table_info.get("database"),
+                            table_info.get("schema"),
+                            table_info.get("table"),
+                            db_service_prefix,
                         )
-                    except ValueError:
-                        logger.debug(f"Skipping table '{table_name}' with invalid FQN characters")
+                    except Exception as exc:  # pylint: disable=broad-except
+                        yield Either(  # pyright: ignore[reportCallIssue]
+                            left=StackTraceError(
+                                name="Dataflow Table Lineage",
+                                error=f"Error resolving table [{table_info.get('table')}] of dataflow [{datamodel.name}]: {exc}",
+                                stackTrace=traceback.format_exc(),
+                            )
+                        )
                         continue
-                    table_entity = self.metadata.search_in_any_service(
-                        entity_type=Table,
-                        fqn_search_string=fqn_search_string,
-                    )
                     if table_entity and datamodel_entity:
                         column_lineage = self._get_dataflow_column_lineage(
                             table_entity=table_entity,

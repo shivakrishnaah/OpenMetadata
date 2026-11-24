@@ -19,6 +19,7 @@ import pytest
 
 from metadata.generated.schema.entity.data.dashboardDataModel import DashboardDataModel, DataModelType
 from metadata.generated.schema.entity.data.table import Column, DataType, Table
+from metadata.generated.schema.metadataIngestion.dashboardServiceMetadataPipeline import LineageInformation
 from metadata.generated.schema.metadataIngestion.workflow import OpenMetadataWorkflowConfig
 from metadata.generated.schema.type.entityReference import EntityReference
 from metadata.ingestion.ometa.ometa_api import OpenMetadata
@@ -37,6 +38,8 @@ from metadata.ingestion.source.dashboard.powerbi.models import (
 )
 
 MODEL_FQN = "powerbi.model.ds-sales"
+# The test tables have no source expression, so a prefix gives the schema their name lookup needs
+WAREHOUSE_SCHEMA = "mssql.sales.dbo"
 CONFIG = {
     "source": {
         "type": "powerbi",
@@ -151,11 +154,22 @@ def _data_model() -> DashboardDataModel:
     )
 
 
+def _search_finds(source: PowerbiSource, warehouse: Table):
+    """OpenMetadata's search finds `warehouse` under the WAREHOUSE_SCHEMA prefix."""
+    source.source_config.lineageInformation = LineageInformation(dbServicePrefixes=[WAREHOUSE_SCHEMA])
+    source.metadata.get_by_name = lambda **_: None
+    return patch.object(
+        source.metadata,
+        "es_search_from_fqn",
+        side_effect=lambda entity_type, **_: [warehouse] if entity_type is Table else [],
+    )
+
+
 def _calculated_entries(source: PowerbiSource, table: PowerBiTable, warehouse: Table, model_tables) -> dict:
-    with patch.object(source.metadata, "search_in_any_service", return_value=warehouse):
+    with _search_finds(source, warehouse):
         [lineage] = list(
             source._get_table_and_datamodel_lineage(
-                db_service_prefix=None,
+                db_service_prefix=WAREHOUSE_SCHEMA,
                 table=table,
                 datamodel_entity=_data_model(),
                 model_tables=model_tables,
@@ -232,14 +246,13 @@ def test_the_api_lineage_path_resolves_against_the_whole_dataset(source):
 
 def test_a_calculated_column_is_not_also_paired_by_name(source):
     # Year is calculated; the warehouse table's own year column must not be read as its copy.
-    with patch.object(
-        source.metadata,
-        "search_in_any_service",
-        return_value=_warehouse("Sales", ["Amount", "Discount", "Order Date", "Year"]),
-    ):
+    with _search_finds(source, _warehouse("Sales", ["Amount", "Discount", "Order Date", "Year"])):
         [lineage] = list(
             source._get_table_and_datamodel_lineage(
-                db_service_prefix=None, table=SALES, datamodel_entity=_data_model(), model_tables=MODEL_TABLES
+                db_service_prefix=WAREHOUSE_SCHEMA,
+                table=SALES,
+                datamodel_entity=_data_model(),
+                model_tables=MODEL_TABLES,
             )
         )
 

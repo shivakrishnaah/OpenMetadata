@@ -485,7 +485,11 @@ def test_files_only_lineage_links_the_warehouse_columns_to_the_calculated_column
 
     with (
         patch.object(files_only_source.metadata, "get_by_name", return_value=data_model),
-        patch.object(files_only_source.metadata, "search_in_any_service", return_value=warehouse),
+        patch.object(
+            files_only_source.metadata,
+            "es_search_from_fqn",
+            side_effect=lambda entity_type, **_: [warehouse] if entity_type is Table else [],
+        ),
         patch.object(files_only_source, "create_table_datamodel_lineage_from_files") as reread_files,
     ):
         lineage = [

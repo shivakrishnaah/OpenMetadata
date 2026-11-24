@@ -8,7 +8,7 @@ from metadata.generated.schema.entity.data.dashboardDataModel import (
     DashboardDataModel,
     DataModelType,
 )
-from metadata.generated.schema.entity.data.table import Column, DataType
+from metadata.generated.schema.entity.data.table import Column, DataType, Table
 from metadata.generated.schema.metadataIngestion.workflow import (
     OpenMetadataWorkflowConfig,
 )
@@ -1381,9 +1381,9 @@ class PowerBIUnitTest(TestCase):
     @pytest.mark.order(23)
     def test_table_name_fallback_when_source_expression_parsing_fails(self):
         """
-        Test that when _parse_table_info_from_source_exp returns None,
-        the _get_table_and_datamodel_lineage method falls back to using
-        the PowerBI table name for lineage.
+        Test that when _parse_table_info_from_source_exp returns None, the
+        _get_table_and_datamodel_lineage method falls back to the PowerBI table
+        name, with the schema dbServicePrefixes gives it.
         """
         from unittest.mock import MagicMock
 
@@ -1401,9 +1401,15 @@ class PowerBIUnitTest(TestCase):
             patch.object(self.powerbi, "_parse_table_info_from_source_exp", return_value=None),
             patch.object(
                 self.powerbi.metadata,
-                "search_in_any_service",
-                return_value=mock_table_entity,
+                "es_search_from_fqn",
+                side_effect=lambda entity_type, **_: [mock_table_entity] if entity_type is Table else [],
             ) as mock_search,
+            patch.object(self.powerbi.metadata, "get_by_name", return_value=None),
+            patch.object(
+                self.powerbi,
+                "get_db_service_prefixes",
+                return_value=["service.database.schema"],
+            ),
             patch.object(self.powerbi, "_get_column_lineage", return_value=[]),
             patch.object(self.powerbi, "_get_add_lineage_request") as mock_lineage_request,
         ):
@@ -1411,16 +1417,19 @@ class PowerBIUnitTest(TestCase):
 
             list(
                 self.powerbi._get_table_and_datamodel_lineage(
-                    db_service_prefix=None,
+                    db_service_prefix="service.database.schema",
                     table=table,
                     datamodel_entity=MOCK_DASHBOARD_DATA_MODEL,
                 )
             )
 
-            mock_search.assert_called_once()
-            call_args = mock_search.call_args
-            fqn_search_string = call_args.kwargs.get("fqn_search_string") or call_args[1].get("fqn_search_string")
+            [fqn_search_string] = [
+                call.kwargs["fqn_search_string"]
+                for call in mock_search.call_args_list
+                if call.kwargs["entity_type"] is Table
+            ]
             self.assertIn("my_powerbi_table", fqn_search_string)
+            mock_lineage_request.assert_called_once()
 
     @pytest.mark.order(24)
     def test_table_name_fallback_with_valid_source_expression(self):
@@ -1443,8 +1452,8 @@ class PowerBIUnitTest(TestCase):
         with (
             patch.object(
                 self.powerbi.metadata,
-                "search_in_any_service",
-                return_value=mock_table_entity,
+                "es_search_from_fqn",
+                side_effect=lambda entity_type, **_: [mock_table_entity] if entity_type is Table else [],
             ) as mock_search,
             patch.object(self.powerbi, "_get_column_lineage", return_value=[]),
             patch.object(self.powerbi, "_get_add_lineage_request") as mock_lineage_request,
@@ -1459,11 +1468,14 @@ class PowerBIUnitTest(TestCase):
                 )
             )
 
-            mock_search.assert_called_once()
-            call_args = mock_search.call_args
-            fqn_search_string = call_args.kwargs.get("fqn_search_string") or call_args[1].get("fqn_search_string")
+            [fqn_search_string] = [
+                call.kwargs["fqn_search_string"]
+                for call in mock_search.call_args_list
+                if call.kwargs["entity_type"] is Table
+            ]
             self.assertIn("customers_clean", fqn_search_string)
             self.assertNotIn("powerbi_table_name", fqn_search_string)
+            mock_lineage_request.assert_called_once()
 
     @pytest.mark.order(25)
     def test_get_dataflow_column_info(self):
@@ -1939,8 +1951,8 @@ class PowerBIUnitTest(TestCase):
         with (
             patch.object(
                 self.powerbi.metadata,
-                "search_in_any_service",
-                return_value=mock_table_entity,
+                "es_search_from_fqn",
+                side_effect=lambda entity_type, **_: [mock_table_entity] if entity_type is Table else [],
             ) as mock_search,
             patch.object(self.powerbi, "_get_add_lineage_request") as mock_lineage_request,
         ):

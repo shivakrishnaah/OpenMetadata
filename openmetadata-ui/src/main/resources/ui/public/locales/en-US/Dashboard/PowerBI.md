@@ -141,3 +141,7 @@ With a Client ID, Client Secret and Tenant ID, the files add lineage from the wa
 
 Without them, the files alone are read: their data models, the lineage from the warehouse tables to them, and, with `Include Metrics`, their measures. Dashboards and reports exist only in the Power BI service, so none are ingested.
 $$
+
+## Lineage
+
+A data model table, or a dataflow entity, is linked to the warehouse table its Power Query source names. That table is looked up in the database services listed in **Database Service Prefixes**, or in every database service when it is empty, and is linked only when exactly one table matches across the services searched. The schema has to be known: from the source, or from a prefix that names it (`service.database.schema`). So a table read by SQL that does not qualify its tables (`FROM Orders`) links only when a prefix gives its schema. A table whose source names no table the connector can read (a push dataset, or a Power Query source its parsers do not read, such as PostgreSQL) is looked up by its Power BI name in the schema a prefix gives, so a calculated or entered-data table named like a table in that schema is linked to it. A table that matches several, for example the same schema and table in two services, is left without lineage; set **Database Service Prefixes** to the service Power BI reads from.
